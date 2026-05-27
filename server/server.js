@@ -204,6 +204,60 @@ function leaveTetrisRoom(socketId) {
   }
 }
 
+// ── 오목 1:1 대결 (대기방 로비) ──
+const OMOK_LOBBY = 'omok:lobby';
+const OMOK_SIZE = 15;
+const omokRooms = new Map(); // roomId -> { id, host, hostName, guest, guestName }
+let omokRoomSeq = 0;
+const omokMatches = new Map(); // matchId -> { players:[black,white], board, turn }
+let omokMatchSeq = 0;
+
+function omokLobbyList() {
+  return Array.from(omokRooms.values()).map((r) => ({
+    id: r.id, hostName: r.hostName, count: r.guest ? 2 : 1, full: !!r.guest,
+  }));
+}
+function broadcastOmokLobby() {
+  io.to(OMOK_LOBBY).emit('omok:lobby:update', { rooms: omokLobbyList() });
+}
+function omokRoomState(r, viewerId) {
+  return {
+    id: r.id, hostName: r.hostName, guestName: r.guestName,
+    count: r.guest ? 2 : 1, isHost: r.host === viewerId,
+  };
+}
+function leaveOmokRoom(socketId) {
+  for (const [rid, r] of omokRooms) {
+    if (r.host === socketId) {
+      if (r.guest) io.to(r.guest).emit('omok:room:closed');
+      omokRooms.delete(rid);
+    } else if (r.guest === socketId) {
+      r.guest = null;
+      r.guestName = null;
+      io.to(r.host).emit('omok:room:update', omokRoomState(r, r.host));
+    }
+  }
+}
+// 마지막 착수 (x,y)를 기준으로 5목 완성 여부 판정
+function checkOmokWin(board, x, y, color) {
+  const dirs = [[1, 0], [0, 1], [1, 1], [1, -1]];
+  for (const [dx, dy] of dirs) {
+    let count = 1;
+    for (let s = 1; s < 5; s++) {
+      const nx = x + dx * s, ny = y + dy * s;
+      if (nx < 0 || nx >= OMOK_SIZE || ny < 0 || ny >= OMOK_SIZE || board[ny][nx] !== color) break;
+      count++;
+    }
+    for (let s = 1; s < 5; s++) {
+      const nx = x - dx * s, ny = y - dy * s;
+      if (nx < 0 || nx >= OMOK_SIZE || ny < 0 || ny >= OMOK_SIZE || board[ny][nx] !== color) break;
+      count++;
+    }
+    if (count >= 5) return true;
+  }
+  return false;
+}
+
 // 사용자별 색상 자동 부여 (닉네임 해시) - 클라이언트가 색을 지정하지 않은 경우의 fallback
 function colorFromNickname(nickname) {
   let hash = 0;
@@ -492,6 +546,91 @@ io.on('connection', (socket) => {
     matches.delete(matchId);
   });
 
+  // ── 오목 대기방 로비 ──
+  socket.on('omok:lobby:enter', (data, ack) => {
+    socket.join(OMOK_LOBBY);
+    ack && ack({ rooms: omokLobbyList() });
+  });
+  socket.on('omok:lobby:leave', () => {
+    socket.leave(OMOK_LOBBY);
+  });
+  socket.on('omok:room:create', (data, ack) => {
+    const p = players.get(socket.id);
+    if (!p) return ack && ack({ ok: false });
+    leaveOmokRoom(socket.id);
+    const id = `o${++omokRoomSeq}`;
+    const room = { id, host: socket.id, hostName: p.nickname, guest: null, guestName: null };
+    omokRooms.set(id, room);
+    ack && ack({ ok: true, room: omokRoomState(room, socket.id) });
+    broadcastOmokLobby();
+  });
+  socket.on('omok:room:join', (data, ack) => {
+    const p = players.get(socket.id);
+    const room = omokRooms.get(data?.roomId);
+    if (!p || !room) return ack && ack({ ok: false, error: '방이 없습니다' });
+    if (room.guest) return ack && ack({ ok: false, error: '방이 가득 찼습니다' });
+    if (room.host === socket.id) return ack && ack({ ok: false, error: '자신의 방입니다' });
+    room.guest = socket.id;
+    room.guestName = p.nickname;
+    ack && ack({ ok: true, room: omokRoomState(room, socket.id) });
+    io.to(room.host).emit('omok:room:update', omokRoomState(room, room.host));
+    broadcastOmokLobby();
+  });
+  socket.on('omok:room:leave', () => {
+    leaveOmokRoom(socket.id);
+    broadcastOmokLobby();
+  });
+  socket.on('omok:room:start', (data, ack) => {
+    const room = omokRooms.get(data?.roomId);
+    if (!room || room.host !== socket.id) return ack && ack({ ok: false });
+    if (!room.guest) return ack && ack({ ok: false, error: '상대가 없습니다' });
+    const hostP = players.get(room.host);
+    const guestP = players.get(room.guest);
+    if (!hostP || !guestP) return ack && ack({ ok: false, error: '상대가 나갔습니다' });
+    const matchId = `om${++omokMatchSeq}`;
+    const board = Array.from({ length: OMOK_SIZE }, () => Array(OMOK_SIZE).fill(null));
+    // 방장이 흑돌(선공), 게스트가 백돌
+    omokMatches.set(matchId, { players: [room.host, room.guest], board, turn: 'black' });
+    io.to(room.host).emit('omok:start', { matchId, color: 'black', opponent: { id: room.guest, nickname: guestP.nickname } });
+    io.to(room.guest).emit('omok:start', { matchId, color: 'white', opponent: { id: room.host, nickname: hostP.nickname } });
+    omokRooms.delete(room.id);
+    ack && ack({ ok: true });
+    broadcastOmokLobby();
+  });
+  // 착수
+  socket.on('omok:move', (data) => {
+    const m = omokMatches.get(data?.matchId);
+    if (!m) return;
+    const idx = m.players.indexOf(socket.id);
+    if (idx < 0) return;
+    const color = idx === 0 ? 'black' : 'white';
+    if (m.turn !== color) return; // 내 턴이 아님
+    const x = Number(data?.x);
+    const y = Number(data?.y);
+    if (!Number.isInteger(x) || !Number.isInteger(y) || x < 0 || x >= OMOK_SIZE || y < 0 || y >= OMOK_SIZE) return;
+    if (m.board[y][x]) return; // 이미 돌이 있음
+    m.board[y][x] = color;
+    const win = checkOmokWin(m.board, x, y, color);
+    m.turn = color === 'black' ? 'white' : 'black';
+    for (const pid of m.players) {
+      io.to(pid).emit('omok:update', { x, y, color, turn: m.turn });
+    }
+    if (win) {
+      for (const pid of m.players) {
+        io.to(pid).emit('omok:result', { win: pid === socket.id });
+      }
+      omokMatches.delete(data.matchId);
+    }
+  });
+  // 게임 중 나가기 → 상대 승
+  socket.on('omok:leave', (data) => {
+    const m = omokMatches.get(data?.matchId);
+    if (!m) return;
+    const oppId = m.players.find((id) => id !== socket.id);
+    if (oppId) io.to(oppId).emit('omok:result', { win: true, reason: 'opponent_left' });
+    omokMatches.delete(data.matchId);
+  });
+
   socket.on('disconnect', () => {
     const p = players.get(socket.id);
     players.delete(socket.id);
@@ -511,6 +650,16 @@ io.on('connection', (socket) => {
         rematchReqs.delete(sid);
         const other = sid === socket.id ? oppId : sid;
         io.to(other).emit('tetris:rematch:cancel');
+      }
+    }
+    // 오목 방/매치 정리
+    leaveOmokRoom(socket.id);
+    broadcastOmokLobby();
+    for (const [mid, m] of omokMatches) {
+      if (m.players.includes(socket.id)) {
+        const oppId = m.players.find((id) => id !== socket.id);
+        if (oppId) io.to(oppId).emit('omok:result', { win: true, reason: 'opponent_left' });
+        omokMatches.delete(mid);
       }
     }
     if (p) {
