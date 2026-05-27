@@ -140,6 +140,7 @@ function TetrisBoard({ mode, matchId, opponentName, onBack }) {
     if (!canPlace(board, shape, 0, col)) {
       s.over = true;
       if (isVersus) getSocket().emit('tetris:over', { matchId });
+      else getSocket().emit('tetris:score', { score: s.score });
     } else {
       s.piece = { type, shape, row: 0, col };
       s.next = randomType();
@@ -421,6 +422,7 @@ export function TetrisGame({ onExit }) {
   const [phase, setPhase] = useState('menu');
   const [match, setMatch] = useState(null);
   const [result, setResult] = useState(null);
+  const [ranking, setRanking] = useState([]);
 
   useEffect(() => {
     const sock = getSocket();
@@ -433,6 +435,14 @@ export function TetrisGame({ onExit }) {
       sock.off('tetris:result', onResult);
     };
   }, []);
+
+  // 메뉴로 올 때마다 랭킹 조회 (게임 종료 후 갱신 반영)
+  useEffect(() => {
+    if (phase !== 'menu') return;
+    getSocket().emit('tetris:ranking', {}, (resp) => {
+      if (resp?.ranking) setRanking(resp.ranking);
+    });
+  }, [phase]);
 
   const startVersus = () => {
     setPhase('matching');
@@ -474,15 +484,36 @@ export function TetrisGame({ onExit }) {
 
   // menu
   return (
-    <div style={menuCard}>
-      <TetrisLogo />
-      <div style={{ fontSize: 13, color: 'rgba(255,255,255,0.5)', marginTop: 12, letterSpacing: 1 }}>
-        블록을 쌓아 줄을 지우세요
+    <div style={menuWrap}>
+      <div style={menuCard}>
+        <TetrisLogo />
+        <div style={{ fontSize: 13, color: 'rgba(255,255,255,0.5)', marginTop: 12, letterSpacing: 1 }}>
+          블록을 쌓아 줄을 지우세요
+        </div>
+        <div style={menuButtons}>
+          <Button onClick={() => setPhase('single')}>혼자 하기</Button>
+          <Button onClick={startVersus}>대결 (1:1)</Button>
+          <Button variant="ghost" onClick={onExit}>나가기</Button>
+        </div>
       </div>
-      <div style={menuButtons}>
-        <Button onClick={() => setPhase('single')}>혼자 하기</Button>
-        <Button onClick={startVersus}>대결 (1:1)</Button>
-        <Button variant="ghost" onClick={onExit}>나가기</Button>
+
+      <div style={rankPanel}>
+        <div style={rankHeader}>🏆 랭킹</div>
+        {ranking.length === 0 ? (
+          <div style={rankEmpty}>아직 기록이 없어요</div>
+        ) : (
+          ranking.slice(0, 10).map((r, i) => (
+            <div key={i} style={rankRow}>
+              <span style={{ width: 20, color: i < 3 ? '#ffd45b' : 'rgba(255,255,255,0.45)', fontWeight: i < 3 ? 700 : 400 }}>
+                {i + 1}
+              </span>
+              <span style={{ flex: 1, textAlign: 'left', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {r.nickname}
+              </span>
+              <span style={{ fontWeight: 700, color: '#9ec1ff' }}>{r.score}</span>
+            </div>
+          ))
+        )}
       </div>
     </div>
   );
@@ -542,6 +573,40 @@ const menuCard = {
 const menuButtons = {
   display: 'flex', flexDirection: 'column', alignItems: 'center',
   gap: 11, marginTop: 24, width: '100%',
+};
+
+const menuWrap = {
+  display: 'flex',
+  alignItems: 'stretch',
+  gap: 16,
+};
+
+const rankPanel = {
+  width: 230,
+  background: 'rgba(11, 16, 48, 0.85)',
+  borderRadius: 16,
+  border: '2px solid rgba(91,141,239,0.35)',
+  boxShadow: '0 24px 60px rgba(0,0,0,0.5)',
+  padding: '20px 18px',
+  display: 'flex',
+  flexDirection: 'column',
+  color: '#fff',
+  overflowY: 'auto',
+  maxHeight: '80vh',
+};
+
+const rankHeader = {
+  fontSize: 15, fontWeight: 700, color: 'rgba(255,255,255,0.85)',
+  marginBottom: 14, textAlign: 'center',
+};
+
+const rankEmpty = {
+  fontSize: 12, color: 'rgba(255,255,255,0.4)', textAlign: 'center', padding: '4px 0',
+};
+
+const rankRow = {
+  display: 'flex', alignItems: 'center', gap: 8,
+  fontSize: 13, color: 'rgba(255,255,255,0.85)', padding: '3px 0',
 };
 
 const primaryBtn = {

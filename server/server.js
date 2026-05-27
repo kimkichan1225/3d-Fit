@@ -37,10 +37,18 @@ async function initDB() {
         created_at TIMESTAMP DEFAULT NOW()
       )
     `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS tetris_scores (
+        nickname TEXT PRIMARY KEY,
+        score INTEGER NOT NULL,
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
     console.log('DB 테이블 초기화 완료');
   } catch (err) {
     console.error('DB 초기화 실패:', err.message);
   }
+  await loadTetrisScores();
 }
 
 async function saveProfile(nickname) {
@@ -80,6 +88,42 @@ async function getRecentChats(limit = 50) {
     console.error('채팅 불러오기 실패:', err.message);
     return [];
   }
+}
+
+// ── 테트리스 싱글 점수 랭킹 (메모리 + DB 백업) ──
+const tetrisScores = new Map(); // nickname -> 최고 점수
+
+async function loadTetrisScores() {
+  if (!pool) return;
+  try {
+    const r = await pool.query('SELECT nickname, score FROM tetris_scores');
+    for (const row of r.rows) tetrisScores.set(row.nickname, row.score);
+  } catch (err) {
+    console.error('테트리스 점수 로드 실패:', err.message);
+  }
+}
+
+async function saveTetrisScore(nickname, score) {
+  const prev = tetrisScores.get(nickname) || 0;
+  if (score <= prev) return; // 최고 기록일 때만 갱신
+  tetrisScores.set(nickname, score);
+  if (!pool) return;
+  try {
+    await pool.query(
+      `INSERT INTO tetris_scores (nickname, score) VALUES ($1, $2)
+       ON CONFLICT (nickname) DO UPDATE SET score = GREATEST(tetris_scores.score, EXCLUDED.score), updated_at = NOW()`,
+      [nickname, score]
+    );
+  } catch (err) {
+    console.error('테트리스 점수 저장 실패:', err.message);
+  }
+}
+
+function getTetrisRanking(limit = 10) {
+  return Array.from(tetrisScores.entries())
+    .map(([nickname, score]) => ({ nickname, score }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
 }
 
 // ── 메모리 상태 ──
@@ -321,6 +365,19 @@ io.on('connection', (socket) => {
     const oppId = opponentOf(data?.matchId, socket.id);
     const lines = Math.max(0, Math.min(20, Number(data?.lines) || 0));
     if (oppId && lines > 0) io.to(oppId).emit('tetris:attack', { lines });
+  });
+
+  // 싱글 점수 기록 (게임오버 시)
+  socket.on('tetris:score', (data) => {
+    const p = players.get(socket.id);
+    if (!p) return;
+    const score = Math.max(0, Math.floor(Number(data?.score) || 0));
+    if (score > 0) saveTetrisScore(p.nickname, score);
+  });
+
+  // 랭킹 조회
+  socket.on('tetris:ranking', (data, ack) => {
+    ack && ack({ ranking: getTetrisRanking(10) });
   });
 
   // 내가 게임오버 → 상대 승리
