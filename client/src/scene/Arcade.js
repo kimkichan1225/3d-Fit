@@ -12,7 +12,8 @@ const _arcadePos = new THREE.Vector3();
 export const LEVEL_ARCADES = {
   2: [
     { id: 'tetris', title: '테트리스', position: [-35, 0.23, 5] },
-    { id: 'omok', title: '오목', position: [-15, 0.23, 5] },
+    { id: 'omok', title: '오목', position: [-25, 0.23, 5] },
+    { id: 'game2048', title: '2048', position: [-15, 0.23, 5] },
   ],
 };
 

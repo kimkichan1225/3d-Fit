@@ -44,11 +44,21 @@ async function initDB() {
         updated_at TIMESTAMP DEFAULT NOW()
       )
     `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS scores (
+        game TEXT NOT NULL,
+        nickname TEXT NOT NULL,
+        score INTEGER NOT NULL,
+        updated_at TIMESTAMP DEFAULT NOW(),
+        PRIMARY KEY (game, nickname)
+      )
+    `);
     console.log('DB 테이블 초기화 완료');
   } catch (err) {
     console.error('DB 초기화 실패:', err.message);
   }
   await loadTetrisScores();
+  await loadScores();
 }
 
 async function saveProfile(nickname) {
@@ -121,6 +131,47 @@ async function saveTetrisScore(nickname, score) {
 
 function getTetrisRanking(limit = 10) {
   return Array.from(tetrisScores.entries())
+    .map(([nickname, score]) => ({ nickname, score }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+}
+
+// ── 범용 점수 랭킹 (게임별, 메모리 + DB 백업) ──
+const scoreBoards = new Map(); // game -> Map<nickname, 최고점>
+
+function boardOf(game) {
+  if (!scoreBoards.has(game)) scoreBoards.set(game, new Map());
+  return scoreBoards.get(game);
+}
+
+async function loadScores() {
+  if (!pool) return;
+  try {
+    const r = await pool.query('SELECT game, nickname, score FROM scores');
+    for (const row of r.rows) boardOf(row.game).set(row.nickname, row.score);
+  } catch (err) {
+    console.error('점수 로드 실패:', err.message);
+  }
+}
+
+async function saveScore(game, nickname, score) {
+  const b = boardOf(game);
+  if (score <= (b.get(nickname) || 0)) return;
+  b.set(nickname, score);
+  if (!pool) return;
+  try {
+    await pool.query(
+      `INSERT INTO scores (game, nickname, score) VALUES ($1, $2, $3)
+       ON CONFLICT (game, nickname) DO UPDATE SET score = GREATEST(scores.score, EXCLUDED.score), updated_at = NOW()`,
+      [game, nickname, score]
+    );
+  } catch (err) {
+    console.error('점수 저장 실패:', err.message);
+  }
+}
+
+function getRanking(game, limit = 10) {
+  return Array.from(boardOf(game).entries())
     .map(([nickname, score]) => ({ nickname, score }))
     .sort((a, b) => b.score - a.score)
     .slice(0, limit);
@@ -505,6 +556,19 @@ io.on('connection', (socket) => {
   // 랭킹 조회
   socket.on('tetris:ranking', (data, ack) => {
     ack && ack({ ranking: getTetrisRanking(10) });
+  });
+
+  // 범용 점수 기록/조회 (게임별)
+  socket.on('score:submit', (data) => {
+    const p = players.get(socket.id);
+    if (!p) return;
+    const game = String(data?.game || '').slice(0, 32);
+    const score = Math.max(0, Math.floor(Number(data?.score) || 0));
+    if (game && score > 0) saveScore(game, p.nickname, score);
+  });
+  socket.on('score:ranking', (data, ack) => {
+    const game = String(data?.game || '').slice(0, 32);
+    ack && ack({ ranking: getRanking(game, 10) });
   });
 
   // 재대결 신청 (양쪽 모두 신청하면 새 매치 시작)
