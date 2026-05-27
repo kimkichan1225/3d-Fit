@@ -154,6 +154,7 @@ const tetrisRooms = new Map(); // roomId -> { id, host, hostName, guest, guestNa
 let roomSeq = 0;
 const matches = new Map(); // matchId -> { players: [id1, id2] }
 let matchSeq = 0;
+const rematchReqs = new Map(); // socketId -> 재대결을 신청한 상대 socketId
 
 // 매치에서 상대 socketId 반환
 function opponentOf(matchId, socketId) {
@@ -452,6 +453,35 @@ io.on('connection', (socket) => {
     ack && ack({ ranking: getTetrisRanking(10) });
   });
 
+  // 재대결 신청 (양쪽 모두 신청하면 새 매치 시작)
+  socket.on('tetris:rematch', (data, ack) => {
+    const oppId = data?.opponentId;
+    const opp = players.get(oppId);
+    const me = players.get(socket.id);
+    if (!opp || !me) return ack && ack({ ok: false, error: '상대가 없습니다' });
+    if (rematchReqs.get(oppId) === socket.id) {
+      // 상대도 나를 지목 → 양쪽 동의, 새 매치
+      rematchReqs.delete(socket.id);
+      rematchReqs.delete(oppId);
+      const matchId = `m${++matchSeq}`;
+      matches.set(matchId, { players: [socket.id, oppId] });
+      io.to(socket.id).emit('tetris:start', { matchId, opponent: { id: oppId, nickname: opp.nickname } });
+      io.to(oppId).emit('tetris:start', { matchId, opponent: { id: socket.id, nickname: me.nickname } });
+      ack && ack({ ok: true, started: true });
+    } else {
+      rematchReqs.set(socket.id, oppId);
+      io.to(oppId).emit('tetris:rematch:request');
+      ack && ack({ ok: true, waiting: true });
+    }
+  });
+
+  // 재대결 취소 (결과 화면을 떠남)
+  socket.on('tetris:rematch:cancel', (data) => {
+    rematchReqs.delete(socket.id);
+    const oppId = data?.opponentId;
+    if (oppId) io.to(oppId).emit('tetris:rematch:cancel');
+  });
+
   // 내가 게임오버 → 상대 승리
   socket.on('tetris:over', (data) => {
     const matchId = data?.matchId;
@@ -466,7 +496,7 @@ io.on('connection', (socket) => {
     const p = players.get(socket.id);
     players.delete(socket.id);
 
-    // 테트리스 방/매치 정리
+    // 테트리스 방/매치/재대결 정리
     leaveTetrisRoom(socket.id);
     broadcastLobby();
     for (const [mid, m] of matches) {
@@ -474,6 +504,13 @@ io.on('connection', (socket) => {
         const oppId = m.players.find((id) => id !== socket.id);
         if (oppId) io.to(oppId).emit('tetris:result', { win: true, reason: 'opponent_left' });
         matches.delete(mid);
+      }
+    }
+    for (const [sid, oppId] of rematchReqs) {
+      if (sid === socket.id || oppId === socket.id) {
+        rematchReqs.delete(sid);
+        const other = sid === socket.id ? oppId : sid;
+        io.to(other).emit('tetris:rematch:cancel');
       }
     }
     if (p) {

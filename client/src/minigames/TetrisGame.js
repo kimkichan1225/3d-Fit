@@ -64,6 +64,30 @@ function TetrisBoard({ mode, matchId, opponentName, onBack }) {
   const [, force] = useReducer((x) => x + 1, 0);
   const g = useRef(null);
   const [opponentBoard, setOpponentBoard] = useState(null);
+  const [flash, setFlash] = useState(false); // 공격 받을 때 보드 플래시
+  const [gaugePulse, setGaugePulse] = useState(false); // 게이지 차오를 때 번쩍
+  const [particles, setParticles] = useState([]); // 줄→게이지 입자 연출
+  const countdownTimerRef = useRef(null);
+  const boardRef = useRef(null); // 파티클 출발 좌표 측정용
+  const gaugeRef = useRef(null); // 파티클 도착(게이지 바) 좌표 측정용
+
+  const removeParticle = useCallback((id) => {
+    setParticles((prev) => prev.filter((p) => p.id !== id));
+  }, []);
+
+  // 시작 카운트다운 타이머 (reset 때마다 재시작)
+  const startCountdown = useCallback(() => {
+    if (countdownTimerRef.current) clearInterval(countdownTimerRef.current);
+    countdownTimerRef.current = setInterval(() => {
+      if (!g.current) return;
+      if (g.current.countdown > 0) {
+        g.current.countdown -= 1;
+        force();
+      } else {
+        clearInterval(countdownTimerRef.current);
+      }
+    }, 1000);
+  }, []);
 
   const reset = useCallback(() => {
     const t = randomType();
@@ -77,10 +101,17 @@ function TetrisBoard({ mode, matchId, opponentName, onBack }) {
       combo: 0,
       gauge: 0, // 대결 공격 게이지 (0~100)
       pendingGarbage: 0, // 받은 공격 줄 (다음 고정 때 정산)
+      countdown: 3, // 시작 카운트다운
       over: false,
       paused: false,
     };
     force();
+    startCountdown();
+  }, [startCountdown]);
+
+  // 언마운트 시 카운트다운 타이머 정리
+  useEffect(() => () => {
+    if (countdownTimerRef.current) clearInterval(countdownTimerRef.current);
   }, []);
 
   // 보드 하단에 가비지(방해) 줄 n개 추가
@@ -107,16 +138,20 @@ function TetrisBoard({ mode, matchId, opponentName, onBack }) {
       });
     });
 
-    let cleared = 0;
-    let garbageCleared = 0; // 지운 줄 중 방해 줄(가비지) 개수
-    for (let r = ROWS - 1; r >= 0; r--) {
-      if (board[r].every((cell) => cell)) {
-        if (board[r].some((cell) => cell === 'garbage')) garbageCleared++;
-        board.splice(r, 1);
-        board.unshift(Array(COLS).fill(null));
-        cleared++;
-        r++;
-      }
+    // 꽉 찬 줄 찾기 (원래 위치 기록 → 클리어 연출용)
+    const fullRows = [];
+    for (let r = 0; r < ROWS; r++) {
+      if (board[r].every((cell) => cell)) fullRows.push(r);
+    }
+    const cleared = fullRows.length;
+    const garbageCleared = fullRows.filter((r) => board[r].some((c) => c === 'garbage')).length;
+    // 즉시 제거: 큰 인덱스부터 splice로 다 제거한 뒤, 제거한 만큼 위에 빈 줄 추가
+    // (제거 중간에 unshift하면 인덱스가 밀려 다음 splice가 엉뚱한 줄을 지운다)
+    for (let i = fullRows.length - 1; i >= 0; i--) {
+      board.splice(fullRows[i], 1);
+    }
+    for (let i = 0; i < cleared; i++) {
+      board.unshift(Array(COLS).fill(null));
     }
     if (cleared > 0) {
       s.lines += cleared;
@@ -135,6 +170,36 @@ function TetrisBoard({ mode, matchId, opponentName, onBack }) {
         gain += garbageCleared * GARBAGE_BONUS;
         gain += Math.max(0, s.combo - 1) * COMBO_BONUS;
         s.gauge += gain;
+        if (gain > 0) {
+          // 지워진 줄 위치 → 게이지 바로 입자가 날아가는 연출
+          const boardEl = boardRef.current;
+          const gaugeEl = gaugeRef.current;
+          if (boardEl && gaugeEl) {
+            const br = boardEl.getBoundingClientRect();
+            const gr = gaugeEl.getBoundingClientRect();
+            const ex = gr.left + gr.width / 2;
+            const ey = gr.top + gr.height / 2;
+            const parts = [];
+            fullRows.forEach((r) => {
+              const cy = br.top + (br.height * (r + 0.5)) / ROWS;
+              for (let k = 0; k < 5; k++) {
+                parts.push({
+                  id: `p${Date.now()}-${r}-${k}-${Math.random().toString(36).slice(2, 6)}`,
+                  sx: br.left + (br.width * (k + 0.5)) / 5,
+                  sy: cy,
+                  ex,
+                  ey,
+                });
+              }
+            });
+            setParticles((prev) => [...prev, ...parts]);
+          }
+          // 입자가 도착할 즈음 게이지 바를 번쩍이게
+          setTimeout(() => {
+            setGaugePulse(true);
+            setTimeout(() => setGaugePulse(false), 350);
+          }, 420);
+        }
         // ④ 게이지가 가득 차면 발사 (초과분 이월)
         while (s.gauge >= GAUGE_MAX) {
           s.gauge -= GAUGE_MAX;
@@ -166,7 +231,7 @@ function TetrisBoard({ mode, matchId, opponentName, onBack }) {
 
   const step = useCallback(() => {
     const s = g.current;
-    if (!s || s.over || s.paused) return;
+    if (!s || s.over || s.paused || s.countdown > 0) return;
     const { board, piece } = s;
     if (canPlace(board, piece.shape, piece.row + 1, piece.col)) {
       piece.row += 1;
@@ -178,7 +243,7 @@ function TetrisBoard({ mode, matchId, opponentName, onBack }) {
 
   const move = useCallback((dx) => {
     const s = g.current;
-    if (!s || s.over || s.paused) return;
+    if (!s || s.over || s.paused || s.countdown > 0) return;
     const { board, piece } = s;
     if (canPlace(board, piece.shape, piece.row, piece.col + dx)) {
       piece.col += dx;
@@ -188,7 +253,7 @@ function TetrisBoard({ mode, matchId, opponentName, onBack }) {
 
   const rotate = useCallback(() => {
     const s = g.current;
-    if (!s || s.over || s.paused) return;
+    if (!s || s.over || s.paused || s.countdown > 0) return;
     const { board, piece } = s;
     const rotated = rotateCW(piece.shape);
     for (const dx of [0, -1, 1, -2, 2]) {
@@ -203,7 +268,7 @@ function TetrisBoard({ mode, matchId, opponentName, onBack }) {
 
   const hardDrop = useCallback(() => {
     const s = g.current;
-    if (!s || s.over || s.paused) return;
+    if (!s || s.over || s.paused || s.countdown > 0) return;
     const { board, piece } = s;
     while (canPlace(board, piece.shape, piece.row + 1, piece.col)) piece.row += 1;
     lockPiece();
@@ -233,6 +298,8 @@ function TetrisBoard({ mode, matchId, opponentName, onBack }) {
     const onBoard = (data) => setOpponentBoard(data.board);
     const onAttack = (data) => {
       if (g.current) g.current.pendingGarbage += data.lines;
+      setFlash(true);
+      setTimeout(() => setFlash(false), 350);
     };
     sock.on('tetris:board', onBoard);
     sock.on('tetris:attack', onAttack);
@@ -257,7 +324,7 @@ function TetrisBoard({ mode, matchId, opponentName, onBack }) {
         if (!isVersus) { s.paused = !s.paused; force(); } // 대결은 일시정지 불가
         return;
       }
-      if (s.paused) return;
+      if (s.paused || s.countdown > 0) return;
       switch (k) {
         case 'ArrowLeft': e.preventDefault(); move(-1); break;
         case 'ArrowRight': e.preventDefault(); move(1); break;
@@ -290,7 +357,10 @@ function TetrisBoard({ mode, matchId, opponentName, onBack }) {
 
   return (
     <div style={wrap}>
-      <div style={boardStyle(CELL)}>
+      {particles.map((p) => (
+        <Particle key={p.id} sx={p.sx} sy={p.sy} ex={p.ex} ey={p.ey} onDone={() => removeParticle(p.id)} />
+      ))}
+      <div ref={boardRef} style={{ ...boardStyle(CELL), ...(flash ? boardFlash : null) }}>
         {display.map((row, i) =>
           row.map((cell, j) => (
             <div
@@ -303,6 +373,12 @@ function TetrisBoard({ mode, matchId, opponentName, onBack }) {
               }}
             />
           ))
+        )}
+
+        {s.countdown > 0 && (
+          <div style={boardOverlay}>
+            <div style={{ fontSize: 72, fontWeight: 800 }}>{s.countdown}</div>
+          </div>
         )}
 
         {(s.over || s.paused) && (
@@ -350,12 +426,13 @@ function TetrisBoard({ mode, matchId, opponentName, onBack }) {
         {isVersus && (
           <div style={panel}>
             <div style={labelStyle}>공격 게이지</div>
-            <div style={gaugeOuter}>
+            <div ref={gaugeRef} style={gaugeOuter}>
               <div
                 style={{
                   ...gaugeInner,
                   width: `${Math.min(100, s.gauge)}%`,
                   background: s.gauge >= 80 ? '#ef4444' : s.gauge >= 50 ? '#eab308' : '#5b8def',
+                  ...(gaugePulse ? { boxShadow: '0 0 14px 3px rgba(255,255,255,0.85)', filter: 'brightness(1.4)' } : null),
                 }}
               />
             </div>
@@ -375,6 +452,33 @@ function TetrisBoard({ mode, matchId, opponentName, onBack }) {
         </div>
       </div>
     </div>
+  );
+}
+
+// 줄 클리어 → 게이지로 날아가는 입자
+function Particle({ sx, sy, ex, ey, onDone }) {
+  const [moved, setMoved] = useState(false);
+  useEffect(() => {
+    const raf = requestAnimationFrame(() => setMoved(true));
+    const t = setTimeout(onDone, 520);
+    return () => { cancelAnimationFrame(raf); clearTimeout(t); };
+  }, [onDone]);
+  return (
+    <div
+      style={{
+        position: 'fixed',
+        left: moved ? ex : sx,
+        top: moved ? ey : sy,
+        width: 8, height: 8, borderRadius: 2,
+        background: '#9ec1ff',
+        boxShadow: '0 0 8px #5b8def',
+        opacity: moved ? 0.15 : 1,
+        transform: moved ? 'scale(0.4)' : 'scale(1)',
+        transition: 'left 0.5s cubic-bezier(0.45,0,0.9,0.5), top 0.5s cubic-bezier(0.45,0,0.9,0.5), opacity 0.5s, transform 0.5s',
+        pointerEvents: 'none',
+        zIndex: 300,
+      }}
+    />
   );
 }
 
@@ -460,6 +564,7 @@ export function TetrisGame({ onExit }) {
   const [ranking, setRanking] = useState([]);
   const [rooms, setRooms] = useState([]); // 로비 방 목록
   const [currentRoom, setCurrentRoom] = useState(null); // 내가 들어간 방
+  const [rematchState, setRematchState] = useState('idle'); // idle | waiting | requested
 
   useEffect(() => {
     const sock = getSocket();
@@ -467,23 +572,30 @@ export function TetrisGame({ onExit }) {
       sock.emit('tetris:lobby:leave');
       setMatch(m);
       setCurrentRoom(null);
+      setRematchState('idle');
       setPhase('versus');
     };
-    const onResult = (r) => { setResult(r); setPhase('result'); };
+    const onResult = (r) => { setResult(r); setRematchState('idle'); setPhase('result'); };
     const onLobby = ({ rooms: list }) => setRooms(list);
     const onRoomUpdate = (room) => setCurrentRoom(room);
     const onRoomClosed = () => { setCurrentRoom(null); setPhase('lobby'); };
+    const onRematchReq = () => setRematchState('requested');
+    const onRematchCancel = () => setRematchState('idle');
     sock.on('tetris:start', onStart);
     sock.on('tetris:result', onResult);
     sock.on('tetris:lobby:update', onLobby);
     sock.on('tetris:room:update', onRoomUpdate);
     sock.on('tetris:room:closed', onRoomClosed);
+    sock.on('tetris:rematch:request', onRematchReq);
+    sock.on('tetris:rematch:cancel', onRematchCancel);
     return () => {
       sock.off('tetris:start', onStart);
       sock.off('tetris:result', onResult);
       sock.off('tetris:lobby:update', onLobby);
       sock.off('tetris:room:update', onRoomUpdate);
       sock.off('tetris:room:closed', onRoomClosed);
+      sock.off('tetris:rematch:request', onRematchReq);
+      sock.off('tetris:rematch:cancel', onRematchCancel);
     };
   }, []);
 
@@ -523,6 +635,16 @@ export function TetrisGame({ onExit }) {
   const startGame = () => {
     if (!currentRoom) return;
     getSocket().emit('tetris:room:start', { roomId: currentRoom.id }, () => {});
+  };
+  const requestRematch = () => {
+    if (!match) return;
+    getSocket().emit('tetris:rematch', { opponentId: match.opponent.id }, (resp) => {
+      if (resp?.waiting) setRematchState('waiting'); // started면 tetris:start로 전환됨
+    });
+  };
+  const cancelRematch = () => {
+    if (match) getSocket().emit('tetris:rematch:cancel', { opponentId: match.opponent.id });
+    setRematchState('idle');
   };
 
   if (phase === 'single') return <TetrisBoard mode="single" onBack={() => setPhase('menu')} />;
@@ -580,15 +702,27 @@ export function TetrisGame({ onExit }) {
 
   if (phase === 'result') {
     const win = result?.win;
+    const canRematch = result?.reason !== 'opponent_left' && !!match;
     return (
       <div style={centerBox}>
         <div style={{ fontSize: 28, fontWeight: 800, color: win ? '#7bd96e' : '#ef6b5b' }}>
           {win ? '승리!' : '패배'}
         </div>
         {result?.reason === 'opponent_left' && <div style={{ opacity: 0.7 }}>상대가 나갔습니다</div>}
+        {canRematch && rematchState === 'requested' && (
+          <div style={{ color: '#9ec1ff', fontSize: 13 }}>상대가 재대결을 신청했어요!</div>
+        )}
+        {canRematch && rematchState === 'waiting' && (
+          <div style={{ opacity: 0.7, fontSize: 13 }}>상대 응답을 기다리는 중…</div>
+        )}
         <div style={{ display: 'flex', gap: 10, marginTop: 8 }}>
-          <Button onClick={() => { setResult(null); setPhase('menu'); }}>메뉴로</Button>
-          <Button variant="ghost" onClick={onExit}>나가기</Button>
+          {canRematch && rematchState !== 'waiting' && (
+            <Button onClick={requestRematch}>
+              {rematchState === 'requested' ? '재대결 수락' : '재대결'}
+            </Button>
+          )}
+          <Button variant="ghost" onClick={() => { cancelRematch(); setResult(null); setPhase('menu'); }}>메뉴로</Button>
+          <Button variant="ghost" onClick={() => { cancelRematch(); onExit(); }}>나가기</Button>
         </div>
       </div>
     );
@@ -646,6 +780,11 @@ const boardStyle = (cell) => ({
   border: '2px solid rgba(255,255,255,0.15)',
 });
 
+const boardFlash = {
+  boxShadow: '0 0 26px 5px rgba(239,68,68,0.85)',
+  borderColor: '#ef4444',
+};
+
 const boardOverlay = {
   position: 'absolute', inset: 0,
   display: 'flex', flexDirection: 'column',
@@ -666,7 +805,7 @@ const gaugeOuter = {
 };
 const gaugeInner = {
   height: '100%', borderRadius: 7,
-  transition: 'width 0.12s linear, background 0.2s',
+  transition: 'width 0.35s ease-out, background 0.25s, box-shadow 0.2s, filter 0.2s',
 };
 
 const centerBox = {
