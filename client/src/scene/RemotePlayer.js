@@ -5,8 +5,7 @@ import { useGLTF, useAnimations } from '@react-three/drei';
 import { SkeletonUtils } from 'three-stdlib';
 import { NameTag } from './NameTag';
 import { applyCharacterColors } from './applyCharacterColors';
-
-const CHARACTER_URL = '/resources/GameView/BaseCharacter.gltf';
+import { CHARACTERS, resolveCharacter } from './characters';
 
 // LocalCharacter의 송신 간격(80ms) + jitter 여유. 패킷이 늦게 와도 점프 없이 이어진다.
 const INTERP_DURATION_MS = 120;
@@ -15,7 +14,8 @@ const _yAxis = new THREE.Vector3(0, 1, 0);
 
 // 다른 플레이어. 서버에서 받은 스냅샷을 시간 기반으로 보간 렌더링.
 export function RemotePlayer({ player }) {
-  const { scene, animations } = useGLTF(CHARACTER_URL);
+  const url = CHARACTERS[resolveCharacter(player.character)].url;
+  const { scene, animations } = useGLTF(url);
   const cloned = useMemo(() => SkeletonUtils.clone(scene), [scene]);
   const groupRef = useRef();
   const characterRef = useRef();
@@ -32,10 +32,10 @@ export function RemotePlayer({ player }) {
   const bubbleTimer = useRef(null);
   const [bubbleText, setBubbleText] = useState('');
 
-  // 피부색/얼굴색 적용 (머티리얼 복제 후 색 설정)
+  // 부위별 색 적용 (머티리얼 복제 후 색 설정)
   useEffect(() => {
-    applyCharacterColors(cloned, { skinColor: player.skinColor, faceColor: player.faceColor });
-  }, [cloned, player.skinColor, player.faceColor]);
+    applyCharacterColors(cloned, player.colors);
+  }, [cloned, player.colors]);
 
   // 그림자 한 번만 활성화
   useEffect(() => {

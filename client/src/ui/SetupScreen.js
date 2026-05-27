@@ -1,4 +1,6 @@
 import { useState } from 'react';
+import { CHARACTERS, COLOR_PARTS, DEFAULT_COLORS, DEFAULT_CHARACTER } from '../scene/characters';
+import { CharacterPreview } from './CharacterPreview';
 
 const COLOR_PALETTE = [
   '#5b8def', // 파랑
@@ -13,13 +15,18 @@ const COLOR_PALETTE = [
   '#9aa0a6', // 회색
 ];
 
-// 피부색 팔레트 (밝은 톤 → 어두운 톤, 핑크빛~황빛 다양하게)
-const SKIN_PALETTE = ['#ffe4d0', '#f6cba6', '#e8a87c', '#cd8552', '#a3633a', '#6e4327'];
-// 눈·눈썹색 팔레트 (검정~갈색~금발 + 포인트 컬러)
-const FACE_PALETTE = ['#1c1c1c', '#3b2417', '#6e4327', '#a3633a', '#c9a35b', '#8a3a2a', '#3a6ea5', '#3a8a5f', '#7a4fa3', '#d96a9a'];
+// 부위별 추천 팔레트 (직접 선택도 가능)
+const PALETTES = {
+  Skin: ['#ffe4d0', '#f6cba6', '#e8a87c', '#cd8552', '#a3633a', '#6e4327'],
+  Hair: ['#1c1c1c', '#3b2417', '#6e4327', '#a3633a', '#c9a35b', '#d96a9a', '#5b8def', '#9aa0a6'],
+  Face: ['#1c1c1c', '#3b2417', '#6e4327', '#a3633a', '#c9a35b', '#8a3a2a'],
+  Shirt: ['#5b8def', '#ef5b8d', '#7bd96e', '#efb35b', '#a855f7', '#ef6b5b', '#22d3ee', '#f1f1f1', '#3b3f5c', '#1c1c1c'],
+  Pants: ['#3b3f5c', '#1c1c1c', '#5c3a21', '#2c5f8a', '#6e4327', '#9aa0a6', '#4a4a4a', '#222222'],
+  Belt: ['#5c3a21', '#1c1c1c', '#6e4327', '#9aa0a6', '#3b3f5c', '#a3633a'],
+};
 
-const DEFAULT_SKIN = '#e8a87c';
-const DEFAULT_FACE = '#3b2417';
+// 색 선택 탭 (캐릭터 부위 + 배지)
+const COLOR_TABS = [...COLOR_PARTS, { key: 'badge', label: '배지' }];
 
 // 색상 선택기: 팔레트 버튼 + 직접 선택(color picker)
 function SwatchPicker({ palette, value, onChange }) {
@@ -55,21 +62,29 @@ function SwatchPicker({ palette, value, onChange }) {
 export function SetupScreen({ onSubmit, error, connecting }) {
   const [nickname, setNickname] = useState('');
   const [color, setColor] = useState(COLOR_PALETTE[0]);
-  const [skinColor, setSkinColor] = useState(DEFAULT_SKIN);
-  const [faceColor, setFaceColor] = useState(DEFAULT_FACE);
+  const [character, setCharacter] = useState(DEFAULT_CHARACTER);
+  const [colors, setColors] = useState(DEFAULT_COLORS);
+  const [activeTab, setActiveTab] = useState(COLOR_PARTS[0].key);
+
+  const setPart = (key, value) => setColors((c) => ({ ...c, [key]: value }));
 
   const submit = (e) => {
     e.preventDefault();
     const n = nickname.trim();
     if (!n) return;
-    onSubmit(n, color, skinColor, faceColor);
+    onSubmit(n, color, character, colors);
   };
 
   return (
     <div style={overlay}>
-      <form style={card} onSubmit={submit}>
-        <h1 style={title}>3d-fit</h1>
-        <p style={subtitle}>가상 사무실에서 동료와 만나세요</p>
+      <div style={container}>
+        <div style={previewPane}>
+          <CharacterPreview character={character} colors={colors} />
+          <div style={previewHint}>{CHARACTERS[character]?.label} 미리보기</div>
+        </div>
+        <form style={card} onSubmit={submit}>
+          <h1 style={title}>3d-fit</h1>
+          <p style={subtitle}>가상 사무실에서 동료와 만나세요</p>
 
         <input
           style={input}
@@ -81,31 +96,58 @@ export function SetupScreen({ onSubmit, error, connecting }) {
         />
 
         <div style={{ marginTop: 4 }}>
-          <div style={label}>배지 색상</div>
-          <SwatchPicker palette={COLOR_PALETTE} value={color} onChange={setColor} />
+          <div style={label}>캐릭터</div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            {Object.entries(CHARACTERS).map(([key, c]) => (
+              <button
+                type="button"
+                key={key}
+                onClick={() => setCharacter(key)}
+                style={{ ...charBtn, ...(character === key ? charBtnActive : null) }}
+              >
+                {c.label}
+              </button>
+            ))}
+          </div>
         </div>
 
         <div>
-          <div style={label}>피부색</div>
-          <SwatchPicker palette={SKIN_PALETTE} value={skinColor} onChange={setSkinColor} />
-        </div>
-
-        <div>
-          <div style={label}>눈·눈썹색</div>
-          <SwatchPicker palette={FACE_PALETTE} value={faceColor} onChange={setFaceColor} />
+          <div style={label}>색상</div>
+          <div style={tabBar}>
+            {COLOR_TABS.map((t) => (
+              <button
+                type="button"
+                key={t.key}
+                onClick={() => setActiveTab(t.key)}
+                style={{ ...tab, ...(activeTab === t.key ? tabActive : null) }}
+              >
+                {t.label}
+              </button>
+            ))}
+          </div>
+          <div style={{ marginTop: 12 }}>
+            {activeTab === 'badge' ? (
+              <SwatchPicker palette={COLOR_PALETTE} value={color} onChange={setColor} />
+            ) : (
+              <SwatchPicker
+                palette={PALETTES[activeTab]}
+                value={colors[activeTab]}
+                onChange={(v) => setPart(activeTab, v)}
+              />
+            )}
+          </div>
         </div>
 
         <div style={preview}>
-          <span style={{ ...colorDot, background: skinColor }} title="피부색" />
-          <span style={{ ...colorDot, background: faceColor }} title="눈·눈썹색" />
           <span style={{ ...badge, background: color }}>{nickname.trim() || '닉네임'}</span>
         </div>
 
-        {error && <div style={errorBox}>{error}</div>}
-        <button type="submit" style={button} disabled={connecting || !nickname.trim()}>
-          {connecting ? '접속 중…' : '입장'}
-        </button>
-      </form>
+          {error && <div style={errorBox}>{error}</div>}
+          <button type="submit" style={button} disabled={connecting || !nickname.trim()}>
+            {connecting ? '접속 중…' : '입장'}
+          </button>
+        </form>
+      </div>
     </div>
   );
 }
@@ -120,17 +162,83 @@ const overlay = {
   zIndex: 100,
 };
 
-const card = {
-  width: 360,
-  padding: 32,
+const container = {
+  display: 'flex',
+  maxHeight: '90vh',
   borderRadius: 16,
-  background: 'rgba(255, 255, 255, 0.05)',
-  border: '1px solid rgba(255, 255, 255, 0.1)',
-  backdropFilter: 'blur(20px)',
+  overflow: 'hidden',
+  border: '1px solid rgba(255,255,255,0.1)',
+  boxShadow: '0 20px 50px rgba(0,0,0,0.45)',
+};
+
+const previewPane = {
+  position: 'relative',
+  width: 300,
+  background: 'radial-gradient(ellipse at 50% 35%, #2e3878 0%, #11142e 75%)',
+  display: 'flex',
+};
+
+const previewHint = {
+  position: 'absolute',
+  bottom: 14,
+  left: 0,
+  right: 0,
+  textAlign: 'center',
+  color: 'rgba(255,255,255,0.55)',
+  fontSize: 12,
+  pointerEvents: 'none',
+};
+
+const card = {
+  width: 340,
+  maxHeight: '90vh',
+  overflowY: 'auto',
+  padding: 32,
+  background: 'rgba(18, 22, 44, 0.9)',
   display: 'flex',
   flexDirection: 'column',
-  gap: 14,
-  boxShadow: '0 20px 50px rgba(0, 0, 0, 0.4)',
+  gap: 12,
+};
+
+const charBtn = {
+  flex: 1,
+  padding: '10px',
+  borderRadius: 10,
+  border: '1px solid rgba(255,255,255,0.15)',
+  background: 'rgba(255,255,255,0.06)',
+  color: 'rgba(255,255,255,0.8)',
+  fontSize: 14,
+  fontWeight: 600,
+  cursor: 'pointer',
+};
+
+const charBtnActive = {
+  background: '#5b8def',
+  borderColor: '#5b8def',
+  color: '#fff',
+};
+
+const tabBar = {
+  display: 'flex',
+  flexWrap: 'wrap',
+  gap: 5,
+};
+
+const tab = {
+  padding: '6px 11px',
+  borderRadius: 8,
+  border: '1px solid rgba(255,255,255,0.12)',
+  background: 'rgba(255,255,255,0.05)',
+  color: 'rgba(255,255,255,0.65)',
+  fontSize: 12,
+  fontWeight: 600,
+  cursor: 'pointer',
+};
+
+const tabActive = {
+  background: '#5b8def',
+  borderColor: '#5b8def',
+  color: '#fff',
 };
 
 const title = {
@@ -214,14 +322,6 @@ const preview = {
   justifyContent: 'center',
   gap: 8,
   marginTop: 4,
-};
-
-const colorDot = {
-  width: 22,
-  height: 22,
-  borderRadius: '50%',
-  border: '1px solid rgba(255,255,255,0.35)',
-  display: 'inline-block',
 };
 
 const badge = {

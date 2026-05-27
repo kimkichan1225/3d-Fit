@@ -7,8 +7,8 @@ import { SkeletonUtils } from 'three-stdlib';
 import { useKeyboardControls } from '../hooks/useKeyboardControls';
 import { NameTag } from './NameTag';
 import { applyCharacterColors } from './applyCharacterColors';
+import { CHARACTERS, resolveCharacter } from './characters';
 
-const CHARACTER_URL = '/resources/GameView/BaseCharacter.gltf';
 const WALK_SPEED = 8;
 const RUN_SPEED = 18;
 const NET_INTERVAL_MS = 80; // 12.5Hz 송신
@@ -21,17 +21,22 @@ const _euler = new THREE.Euler(0, 0, 0, 'YXZ');
 
 // 본인 캐릭터. 키 입력으로 RigidBody를 움직이고, 모델은 RigidBody의 자식으로 두어
 // Rapier의 내장 보간(interpolate)으로 부드러운 위치 동기화를 받는다.
-export function LocalCharacter({ characterRef, spawnPosition, onNetUpdate, nickname, color, skinColor, faceColor }) {
-  const { scene, animations } = useGLTF(CHARACTER_URL);
+export function LocalCharacter({ characterRef, spawnPosition, onNetUpdate, nickname, color, character, colors, paused }) {
+  const url = CHARACTERS[resolveCharacter(character)].url;
+  const { scene, animations } = useGLTF(url);
   const cloned = useMemo(() => SkeletonUtils.clone(scene), [scene]);
   const { actions } = useAnimations(animations, characterRef);
 
-  // 피부색/얼굴색 적용 (머티리얼 복제 후 색 설정)
+  // 부위별 색 적용 (머티리얼 복제 후 색 설정)
   useEffect(() => {
-    applyCharacterColors(cloned, { skinColor, faceColor });
-  }, [cloned, skinColor, faceColor]);
+    applyCharacterColors(cloned, colors);
+  }, [cloned, colors]);
 
-  const { forward, backward, left, right, shift } = useKeyboardControls();
+  const rawControls = useKeyboardControls();
+  // 미니게임 중에는 캐릭터 조작 입력을 무시한다
+  const { forward, backward, left, right, shift } = paused
+    ? { forward: false, backward: false, left: false, right: false, shift: false }
+    : rawControls;
   const [currentAnimation, setCurrentAnimation] = useState('Idle');
 
   const rigidBodyRef = useRef();
@@ -208,4 +213,3 @@ export function LocalCharacter({ characterRef, spawnPosition, onNetUpdate, nickn
   );
 }
 
-useGLTF.preload(CHARACTER_URL);

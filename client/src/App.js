@@ -8,9 +8,11 @@ import { ChatPanel } from './ui/ChatPanel';
 import { Sky } from './scene/Sky';
 import { GameMap, LEVEL_MAPS } from './scene/GameMap';
 import { DoorInteraction } from './scene/DoorInteraction';
+import { Arcades, LEVEL_ARCADES } from './scene/Arcade';
 import { LocalCharacter } from './scene/LocalCharacter';
 import { RemotePlayer } from './scene/RemotePlayer';
 import { CameraController } from './scene/CameraController';
+import { MinigameOverlay } from './minigames/MinigameOverlay';
 
 const MAX_CHAT = 80;
 
@@ -43,19 +45,23 @@ export default function App() {
   const [currentLevel, setCurrentLevel] = useState(1);
   const [doors, setDoors] = useState({}); // 현재 레벨 문들의 위치 { name: Vector3 }
   const [nearDoor, setNearDoor] = useState(null); // 가까이 있는 문 { name, target, label }
+  const [nearArcade, setNearArcade] = useState(null); // 가까이 있는 게임기
+  const [activeGame, setActiveGame] = useState(null); // 실행 중인 미니게임 id
 
   const characterRef = useRef(null);
   const nearDoorRef = useRef(null); // E키 핸들러에서 최신값 참조용
+  const nearArcadeRef = useRef(null);
+  const activeGameRef = useRef(null);
   const changingLevelRef = useRef(false); // 레벨 전환 중복 방지
 
   // ── 닉네임 입력 → 서버 join ──
-  const handleJoin = useCallback((nickname, color, skinColor, faceColor) => {
+  const handleJoin = useCallback((nickname, color, character, colors) => {
     setError('');
     setConnecting(true);
     const sock = connect();
 
     const tryJoin = () => {
-      sock.emit('player:join', { nickname, color, skinColor, faceColor }, (resp) => {
+      sock.emit('player:join', { nickname, color, character, colors }, (resp) => {
         setConnecting(false);
         if (!resp?.ok) {
           setError(resp?.error || '접속 실패');
@@ -163,6 +169,8 @@ export default function App() {
       setDoors({});
       setNearDoor(null);
       nearDoorRef.current = null;
+      setNearArcade(null);
+      nearArcadeRef.current = null;
     });
   }, []);
 
@@ -171,18 +179,39 @@ export default function App() {
     setNearDoor(door);
   }, []);
 
-  // E키로 가까운 문 입장
+  const handleNearArcadeChange = useCallback((arcade) => {
+    nearArcadeRef.current = arcade;
+    setNearArcade(arcade);
+  }, []);
+
+  const openGame = useCallback((id) => {
+    activeGameRef.current = id;
+    setActiveGame(id);
+  }, []);
+
+  const closeGame = useCallback(() => {
+    activeGameRef.current = null;
+    setActiveGame(null);
+  }, []);
+
+  // E키: 게임기 > 문 순으로 상호작용 (게임 중엔 무시)
   useEffect(() => {
     const onKey = (e) => {
       if (e.key.toLowerCase() !== 'e') return;
       const el = document.activeElement;
       if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) return;
+      if (activeGameRef.current) return;
+      const na = nearArcadeRef.current;
+      if (na) {
+        openGame(na.id);
+        return;
+      }
       const nd = nearDoorRef.current;
       if (nd) changeLevel(nd);
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [changeLevel]);
+  }, [changeLevel, openGame]);
 
   const spawnPos = useMemo(() => {
     if (!self) return [0, 1.7, -60];
@@ -225,14 +254,21 @@ export default function App() {
             onNetUpdate={handleNetUpdate}
             nickname={self.nickname}
             color={self.color}
-            skinColor={self.skinColor}
-            faceColor={self.faceColor}
+            character={self.character}
+            colors={self.colors}
+            paused={!!activeGame}
           />
           <DoorInteraction
             characterRef={characterRef}
             doors={doors}
             doorConfig={LEVEL_DOORS[currentLevel] || {}}
             onNearDoorChange={handleNearDoorChange}
+          />
+          <Arcades
+            key={`arcade-${currentLevel}`}
+            characterRef={characterRef}
+            arcades={LEVEL_ARCADES[currentLevel] || []}
+            onNearChange={handleNearArcadeChange}
           />
         </Physics>
 
@@ -247,11 +283,17 @@ export default function App() {
       <TopBar self={self} count={Object.keys(players).length + 1} level={currentLevel} />
       <ChatPanel messages={messages} onSend={handleSendChat} myNickname={self.nickname} />
       <HelpHint />
-      {nearDoor && (
+      {!activeGame && nearArcade && (
+        <div style={doorPromptStyle}>
+          🎮 <kbd>E</kbd> 키를 눌러 {nearArcade.title} 플레이
+        </div>
+      )}
+      {!activeGame && !nearArcade && nearDoor && (
         <div style={doorPromptStyle}>
           🚪 <kbd>E</kbd> 키를 눌러 {nearDoor.label}{nearDoor.label === '마을' ? '으로 가기' : ' 입장'}
         </div>
       )}
+      {activeGame && <MinigameOverlay gameId={activeGame} onExit={closeGame} />}
     </>
   );
 }

@@ -83,7 +83,7 @@ async function getRecentChats(limit = 50) {
 }
 
 // ── 메모리 상태 ──
-// players: socketId -> { id, nickname, x, y, z, ry, anim, color, skinColor, faceColor }
+// players: socketId -> { id, nickname, x, y, z, ry, anim, color, character, colors, level }
 const players = new Map();
 
 const SPAWN_POSITION = { x: 0, y: 1.7, z: 0 };
@@ -95,9 +95,26 @@ const roomName = (level) => `level:${level}`;
 const playersInLevel = (level) =>
   Array.from(players.values()).filter((p) => p.level === level);
 
-// 피부색/얼굴색 기본값 (클라이언트가 지정하지 않은 경우)
-const DEFAULT_SKIN = '#e8a87c';
-const DEFAULT_FACE = '#3b2417';
+// 캐릭터 부위별 색 (클라이언트가 지정하지 않은 경우 기본값)
+const CHARACTER_KEYS = ['male', 'female'];
+const DEFAULT_CHARACTER = 'male';
+const COLOR_PART_KEYS = ['Skin', 'Hair', 'Face', 'Shirt', 'Pants', 'Belt'];
+const DEFAULT_COLORS = {
+  Skin: '#e8a87c', Hair: '#3b2417', Face: '#3b2417',
+  Shirt: '#5b8def', Pants: '#3b3f5c', Belt: '#5c3a21',
+};
+
+// ── 테트리스 1:1 대결 ──
+let tetrisWaiting = null; // 매칭 대기 중인 socketId (1명)
+const matches = new Map(); // matchId -> { players: [id1, id2] }
+let matchSeq = 0;
+
+// 매치에서 상대 socketId 반환
+function opponentOf(matchId, socketId) {
+  const m = matches.get(matchId);
+  if (!m) return null;
+  return m.players.find((id) => id !== socketId) || null;
+}
 
 // 사용자별 색상 자동 부여 (닉네임 해시) - 클라이언트가 색을 지정하지 않은 경우의 fallback
 function colorFromNickname(nickname) {
@@ -112,6 +129,17 @@ function colorFromNickname(nickname) {
 // 색상 문자열 검증 (#rrggbb 또는 #rgb)
 function isValidColor(c) {
   return typeof c === 'string' && /^#[0-9a-fA-F]{3}([0-9a-fA-F]{3})?$/.test(c);
+}
+
+// 부위별 색 객체 검증 (유효하지 않은 값은 기본값으로 대체)
+function sanitizeColors(input) {
+  const out = { ...DEFAULT_COLORS };
+  if (input && typeof input === 'object') {
+    for (const k of COLOR_PART_KEYS) {
+      if (isValidColor(input[k])) out[k] = input[k];
+    }
+  }
+  return out;
 }
 
 io.on('connection', (socket) => {
@@ -132,14 +160,14 @@ io.on('connection', (socket) => {
     }
 
     const color = isValidColor(data?.color) ? data.color : colorFromNickname(nickname);
-    const skinColor = isValidColor(data?.skinColor) ? data.skinColor : DEFAULT_SKIN;
-    const faceColor = isValidColor(data?.faceColor) ? data.faceColor : DEFAULT_FACE;
+    const character = CHARACTER_KEYS.includes(data?.character) ? data.character : DEFAULT_CHARACTER;
+    const colors = sanitizeColors(data?.colors);
     const player = {
       id: socket.id,
       nickname,
       color,
-      skinColor,
-      faceColor,
+      character,
+      colors,
       level: 1, // 처음엔 항상 Level1(마을)에서 시작
       x: SPAWN_POSITION.x,
       y: SPAWN_POSITION.y,
@@ -250,9 +278,74 @@ io.on('connection', (socket) => {
     });
   });
 
+  // ── 테트리스 대결 ──
+  // 매칭 대기열 등록. 대기자가 있으면 즉시 매치 성사.
+  socket.on('tetris:queue', (data, ack) => {
+    const p = players.get(socket.id);
+    if (!p) {
+      ack && ack({ ok: false });
+      return;
+    }
+    if (tetrisWaiting === socket.id) return; // 이미 대기 중
+
+    if (tetrisWaiting && players.has(tetrisWaiting) && tetrisWaiting !== socket.id) {
+      // 상대와 매치 성사
+      const oppId = tetrisWaiting;
+      tetrisWaiting = null;
+      const opp = players.get(oppId);
+      const matchId = `m${++matchSeq}`;
+      matches.set(matchId, { players: [oppId, socket.id] });
+      io.to(oppId).emit('tetris:start', { matchId, opponent: { id: socket.id, nickname: p.nickname } });
+      io.to(socket.id).emit('tetris:start', { matchId, opponent: { id: oppId, nickname: opp.nickname } });
+      ack && ack({ ok: true, matched: true });
+    } else {
+      // 대기열 등록
+      tetrisWaiting = socket.id;
+      ack && ack({ ok: true, waiting: true });
+    }
+  });
+
+  // 매칭 취소
+  socket.on('tetris:cancel', () => {
+    if (tetrisWaiting === socket.id) tetrisWaiting = null;
+  });
+
+  // 보드 상태 중계 (상대 미니뷰용)
+  socket.on('tetris:board', (data) => {
+    const oppId = opponentOf(data?.matchId, socket.id);
+    if (oppId) io.to(oppId).volatile.emit('tetris:board', { board: data.board });
+  });
+
+  // 공격 줄 전송
+  socket.on('tetris:attack', (data) => {
+    const oppId = opponentOf(data?.matchId, socket.id);
+    const lines = Math.max(0, Math.min(20, Number(data?.lines) || 0));
+    if (oppId && lines > 0) io.to(oppId).emit('tetris:attack', { lines });
+  });
+
+  // 내가 게임오버 → 상대 승리
+  socket.on('tetris:over', (data) => {
+    const matchId = data?.matchId;
+    if (!matches.has(matchId)) return;
+    const oppId = opponentOf(matchId, socket.id);
+    io.to(socket.id).emit('tetris:result', { win: false });
+    if (oppId) io.to(oppId).emit('tetris:result', { win: true });
+    matches.delete(matchId);
+  });
+
   socket.on('disconnect', () => {
     const p = players.get(socket.id);
     players.delete(socket.id);
+
+    // 테트리스 매칭/매치 정리
+    if (tetrisWaiting === socket.id) tetrisWaiting = null;
+    for (const [mid, m] of matches) {
+      if (m.players.includes(socket.id)) {
+        const oppId = m.players.find((id) => id !== socket.id);
+        if (oppId) io.to(oppId).emit('tetris:result', { win: true, reason: 'opponent_left' });
+        matches.delete(mid);
+      }
+    }
     if (p) {
       // 같은 레벨에 있던 사람들에게만 퇴장 알림
       socket.to(roomName(p.level)).emit('player:left', { id: socket.id });
