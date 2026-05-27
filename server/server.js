@@ -88,6 +88,13 @@ const players = new Map();
 
 const SPAWN_POSITION = { x: 0, y: 1.7, z: 0 };
 
+// 레벨(맵) 개수. 같은 레벨에 있는 플레이어끼리만 서로 보인다.
+const LEVEL_COUNT = 4;
+const roomName = (level) => `level:${level}`;
+// 지정한 레벨에 있는 플레이어 목록
+const playersInLevel = (level) =>
+  Array.from(players.values()).filter((p) => p.level === level);
+
 // 피부색/얼굴색 기본값 (클라이언트가 지정하지 않은 경우)
 const DEFAULT_SKIN = '#e8a87c';
 const DEFAULT_FACE = '#3b2417';
@@ -133,6 +140,7 @@ io.on('connection', (socket) => {
       color,
       skinColor,
       faceColor,
+      level: 1, // 처음엔 항상 Level1(마을)에서 시작
       x: SPAWN_POSITION.x,
       y: SPAWN_POSITION.y,
       z: SPAWN_POSITION.z,
@@ -140,29 +148,71 @@ io.on('connection', (socket) => {
       anim: 'Idle',
     };
     players.set(socket.id, player);
+    socket.join(roomName(player.level));
 
     await saveProfile(nickname);
     const recentChats = await getRecentChats(30);
 
-    // 본인에게 초기 상태 전달
+    // 본인에게 초기 상태 전달 (같은 레벨 플레이어만)
     ack &&
       ack({
         ok: true,
         self: player,
-        players: Array.from(players.values()),
+        players: playersInLevel(player.level),
         recentChats,
       });
 
-    // 다른 사람들에게 알림
-    socket.broadcast.emit('player:joined', player);
+    // 같은 레벨에 있는 다른 사람들에게만 알림
+    socket.to(roomName(player.level)).emit('player:joined', player);
 
-    // 시스템 메시지
-    io.emit('chat:message', {
+    // 시스템 메시지 (같은 레벨에만)
+    io.to(roomName(player.level)).emit('chat:message', {
       nickname: 'system',
       message: `${nickname}님이 접속했습니다`,
       type: 'system',
       created_at: new Date().toISOString(),
     });
+  });
+
+  // 레벨(맵) 이동: 문 상호작용 시 호출. 기존 레벨 룸에서 나가고 새 레벨 룸으로 이동한다.
+  socket.on('player:changeLevel', (data, ack) => {
+    const p = players.get(socket.id);
+    if (!p) {
+      ack && ack({ ok: false, error: '플레이어를 찾을 수 없습니다' });
+      return;
+    }
+    let level = Number(data?.level);
+    if (!Number.isInteger(level) || level < 1 || level > LEVEL_COUNT) {
+      ack && ack({ ok: false, error: '잘못된 레벨입니다' });
+      return;
+    }
+
+    // 스폰 좌표 (사용한 문 기준). 유효하지 않으면 기본 스폰 위치 사용.
+    const s = data?.spawn;
+    const spawn =
+      Array.isArray(s) && s.length === 3 && s.every((n) => typeof n === 'number' && Number.isFinite(n))
+        ? { x: s[0], y: s[1], z: s[2] }
+        : SPAWN_POSITION;
+
+    const oldLevel = p.level;
+    // 기존 레벨 사람들에게 퇴장 알림
+    socket.leave(roomName(oldLevel));
+    socket.to(roomName(oldLevel)).emit('player:left', { id: socket.id });
+
+    // 새 레벨로 이동 + 스폰 위치 설정
+    p.level = level;
+    p.x = spawn.x;
+    p.y = spawn.y;
+    p.z = spawn.z;
+    p.ry = 0;
+    p.anim = 'Idle';
+    socket.join(roomName(level));
+
+    // 새 레벨 사람들에게 등장 알림
+    socket.to(roomName(level)).emit('player:joined', p);
+
+    // 본인에게 새 레벨의 플레이어 목록 전달
+    ack && ack({ ok: true, self: p, players: playersInLevel(level) });
   });
 
   socket.on('player:move', (data) => {
@@ -173,7 +223,8 @@ io.on('connection', (socket) => {
     p.z = Number(data.z) || 0;
     p.ry = Number(data.ry) || 0;
     p.anim = (data.anim || 'Idle').toString();
-    socket.broadcast.volatile.emit('player:moved', {
+    // 같은 레벨에 있는 사람들에게만 위치 전송
+    socket.to(roomName(p.level)).volatile.emit('player:moved', {
       id: socket.id,
       x: p.x,
       y: p.y,
@@ -189,7 +240,8 @@ io.on('connection', (socket) => {
     const text = (data?.message || '').toString().slice(0, 200);
     if (!text.trim()) return;
     await saveChat(p.nickname, text);
-    io.emit('chat:message', {
+    // 같은 레벨에 있는 사람들에게만 채팅 전송
+    io.to(roomName(p.level)).emit('chat:message', {
       id: socket.id,
       nickname: p.nickname,
       message: text,
@@ -201,9 +253,10 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     const p = players.get(socket.id);
     players.delete(socket.id);
-    io.emit('player:left', { id: socket.id });
     if (p) {
-      io.emit('chat:message', {
+      // 같은 레벨에 있던 사람들에게만 퇴장 알림
+      socket.to(roomName(p.level)).emit('player:left', { id: socket.id });
+      io.to(roomName(p.level)).emit('chat:message', {
         nickname: 'system',
         message: `${p.nickname}님이 퇴장했습니다`,
         type: 'system',

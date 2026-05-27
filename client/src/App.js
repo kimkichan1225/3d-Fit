@@ -6,12 +6,33 @@ import { connect, getSocket } from './net/socket';
 import { SetupScreen } from './ui/SetupScreen';
 import { ChatPanel } from './ui/ChatPanel';
 import { Sky } from './scene/Sky';
-import { Level1Map } from './scene/Level1Map';
+import { GameMap, LEVEL_MAPS } from './scene/GameMap';
+import { DoorInteraction } from './scene/DoorInteraction';
 import { LocalCharacter } from './scene/LocalCharacter';
 import { RemotePlayer } from './scene/RemotePlayer';
 import { CameraController } from './scene/CameraController';
 
 const MAX_CHAT = 80;
+
+// 레벨별 문 연결 정보: 문 노드 이름 → { target: 이동할 레벨, label: 안내 문구 }
+// (문의 실제 위치는 맵 GLB 안의 door 노드에서 자동으로 읽어온다)
+// spawn: 그 문으로 이동했을 때 목적지에서 등장할 좌표 (Portfolio 기준)
+const LEVEL_DOORS = {
+  1: {
+    door001: { target: 2, label: '프로젝트 갤러리', spawn: [0, 2, 0] },
+    door: { target: 3, label: '기술 스택 사무실', spawn: [0, 2, 0] },
+  },
+  2: {
+    door001: { target: 1, label: '마을', spawn: [9.96, 0.29, -61.47] },
+  },
+  3: {
+    door: { target: 1, label: '마을', spawn: [-41.16, 0.29, -26.0] },
+    door002: { target: 4, label: '다음 사무실', spawn: [0, 2, 0] },
+  },
+  4: {
+    door002: { target: 3, label: '이전 사무실', spawn: [-40.53, 0.32, -16.26] },
+  },
+};
 
 export default function App() {
   const [self, setSelf] = useState(null); // { id, nickname, color, x, y, z }
@@ -19,8 +40,13 @@ export default function App() {
   const [connecting, setConnecting] = useState(false);
   const [players, setPlayers] = useState({}); // id -> player
   const [messages, setMessages] = useState([]);
+  const [currentLevel, setCurrentLevel] = useState(1);
+  const [doors, setDoors] = useState({}); // 현재 레벨 문들의 위치 { name: Vector3 }
+  const [nearDoor, setNearDoor] = useState(null); // 가까이 있는 문 { name, target, label }
 
   const characterRef = useRef(null);
+  const nearDoorRef = useRef(null); // E키 핸들러에서 최신값 참조용
+  const changingLevelRef = useRef(false); // 레벨 전환 중복 방지
 
   // ── 닉네임 입력 → 서버 join ──
   const handleJoin = useCallback((nickname, color, skinColor, faceColor) => {
@@ -120,6 +146,44 @@ export default function App() {
     getSocket().emit('chat:send', { message: text });
   }, []);
 
+  // ── 레벨(맵) 이동 ──
+  const changeLevel = useCallback((door) => {
+    if (!door || changingLevelRef.current) return;
+    changingLevelRef.current = true;
+    getSocket().emit('player:changeLevel', { level: door.target, spawn: door.spawn }, (resp) => {
+      changingLevelRef.current = false;
+      if (!resp?.ok) return;
+      const m = {};
+      for (const p of resp.players) {
+        if (p.id !== resp.self.id) m[p.id] = p;
+      }
+      setPlayers(m);
+      setSelf(resp.self);
+      setCurrentLevel(resp.self.level);
+      setDoors({});
+      setNearDoor(null);
+      nearDoorRef.current = null;
+    });
+  }, []);
+
+  const handleNearDoorChange = useCallback((door) => {
+    nearDoorRef.current = door;
+    setNearDoor(door);
+  }, []);
+
+  // E키로 가까운 문 입장
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key.toLowerCase() !== 'e') return;
+      const el = document.activeElement;
+      if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) return;
+      const nd = nearDoorRef.current;
+      if (nd) changeLevel(nd);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [changeLevel]);
+
   const spawnPos = useMemo(() => {
     if (!self) return [0, 1.7, -60];
     return [self.x, self.y, self.z];
@@ -153,8 +217,9 @@ export default function App() {
         />
 
         <Physics gravity={[0, -9.81, 0]}>
-          <Level1Map />
+          <GameMap key={`map-${currentLevel}`} url={LEVEL_MAPS[currentLevel]} onDoorsFound={setDoors} />
           <LocalCharacter
+            key={`char-${currentLevel}`}
             characterRef={characterRef}
             spawnPosition={spawnPos}
             onNetUpdate={handleNetUpdate}
@@ -162,6 +227,12 @@ export default function App() {
             color={self.color}
             skinColor={self.skinColor}
             faceColor={self.faceColor}
+          />
+          <DoorInteraction
+            characterRef={characterRef}
+            doors={doors}
+            doorConfig={LEVEL_DOORS[currentLevel] || {}}
+            onNearDoorChange={handleNearDoorChange}
           />
         </Physics>
 
@@ -173,21 +244,27 @@ export default function App() {
         <CameraController characterRef={characterRef} />
       </Canvas>
 
-      <TopBar self={self} count={Object.keys(players).length + 1} />
+      <TopBar self={self} count={Object.keys(players).length + 1} level={currentLevel} />
       <ChatPanel messages={messages} onSend={handleSendChat} myNickname={self.nickname} />
       <HelpHint />
+      {nearDoor && (
+        <div style={doorPromptStyle}>
+          🚪 <kbd>E</kbd> 키를 눌러 {nearDoor.label}{nearDoor.label === '마을' ? '으로 가기' : ' 입장'}
+        </div>
+      )}
     </>
   );
 }
 
-function TopBar({ self, count }) {
+function TopBar({ self, count, level }) {
   return (
     <div style={topBarStyle}>
       <div>
         <span style={{ opacity: 0.6 }}>나: </span>
         <span style={{ color: self.color, fontWeight: 600 }}>{self.nickname}</span>
+        <span style={{ opacity: 0.5, marginLeft: 10 }}>Level {level}</span>
       </div>
-      <div style={{ opacity: 0.7 }}>접속 인원 {count}명</div>
+      <div style={{ opacity: 0.7 }}>이 레벨 {count}명</div>
     </div>
   );
 }
@@ -195,7 +272,7 @@ function TopBar({ self, count }) {
 function HelpHint() {
   return (
     <div style={hintStyle}>
-      <kbd>W/A/S/D</kbd> 이동 · <kbd>Shift</kbd> 달리기 · <kbd>Enter</kbd> 채팅
+      <kbd>W/A/S/D</kbd> 이동 · <kbd>Shift</kbd> 달리기 · <kbd>E</kbd> 문 입장 · <kbd>Enter</kbd> 채팅
     </div>
   );
 }
@@ -229,4 +306,21 @@ const hintStyle = {
   color: 'rgba(255,255,255,0.8)',
   fontSize: 12,
   zIndex: 50,
+};
+
+const doorPromptStyle = {
+  position: 'fixed',
+  bottom: 90,
+  left: '50%',
+  transform: 'translateX(-50%)',
+  padding: '12px 22px',
+  borderRadius: 12,
+  background: 'rgba(10, 12, 30, 0.8)',
+  border: '1px solid rgba(255,255,255,0.2)',
+  backdropFilter: 'blur(14px)',
+  color: '#fff',
+  fontSize: 15,
+  fontWeight: 600,
+  zIndex: 60,
+  pointerEvents: 'none',
 };
