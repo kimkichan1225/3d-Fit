@@ -148,8 +148,10 @@ const DEFAULT_COLORS = {
   Shirt: '#5b8def', Pants: '#3b3f5c', Belt: '#5c3a21',
 };
 
-// ── 테트리스 1:1 대결 ──
-let tetrisWaiting = null; // 매칭 대기 중인 socketId (1명)
+// ── 테트리스 1:1 대결 (대기방 로비) ──
+const TETRIS_LOBBY = 'tetris:lobby';
+const tetrisRooms = new Map(); // roomId -> { id, host, hostName, guest, guestName }
+let roomSeq = 0;
 const matches = new Map(); // matchId -> { players: [id1, id2] }
 let matchSeq = 0;
 
@@ -158,6 +160,47 @@ function opponentOf(matchId, socketId) {
   const m = matches.get(matchId);
   if (!m) return null;
   return m.players.find((id) => id !== socketId) || null;
+}
+
+// 로비에 표시할 방 목록
+function lobbyList() {
+  return Array.from(tetrisRooms.values()).map((r) => ({
+    id: r.id,
+    hostName: r.hostName,
+    count: r.guest ? 2 : 1,
+    full: !!r.guest,
+  }));
+}
+
+function broadcastLobby() {
+  io.to(TETRIS_LOBBY).emit('tetris:lobby:update', { rooms: lobbyList() });
+}
+
+// 특정 시점의 방 상태 (viewer 기준 isHost 포함)
+function roomState(r, viewerId) {
+  return {
+    id: r.id,
+    hostName: r.hostName,
+    guestName: r.guestName,
+    count: r.guest ? 2 : 1,
+    isHost: r.host === viewerId,
+  };
+}
+
+// 방에서 나가기/정리 (나가기·접속종료 공용)
+function leaveTetrisRoom(socketId) {
+  for (const [rid, r] of tetrisRooms) {
+    if (r.host === socketId) {
+      // 방장이 나가면 방 삭제, 게스트에게 알림
+      if (r.guest) io.to(r.guest).emit('tetris:room:closed');
+      tetrisRooms.delete(rid);
+    } else if (r.guest === socketId) {
+      // 게스트가 나가면 방은 다시 대기 상태
+      r.guest = null;
+      r.guestName = null;
+      io.to(r.host).emit('tetris:room:update', roomState(r, r.host));
+    }
+  }
 }
 
 // 사용자별 색상 자동 부여 (닉네임 해시) - 클라이언트가 색을 지정하지 않은 경우의 fallback
@@ -322,36 +365,65 @@ io.on('connection', (socket) => {
     });
   });
 
-  // ── 테트리스 대결 ──
-  // 매칭 대기열 등록. 대기자가 있으면 즉시 매치 성사.
-  socket.on('tetris:queue', (data, ack) => {
-    const p = players.get(socket.id);
-    if (!p) {
-      ack && ack({ ok: false });
-      return;
-    }
-    if (tetrisWaiting === socket.id) return; // 이미 대기 중
-
-    if (tetrisWaiting && players.has(tetrisWaiting) && tetrisWaiting !== socket.id) {
-      // 상대와 매치 성사
-      const oppId = tetrisWaiting;
-      tetrisWaiting = null;
-      const opp = players.get(oppId);
-      const matchId = `m${++matchSeq}`;
-      matches.set(matchId, { players: [oppId, socket.id] });
-      io.to(oppId).emit('tetris:start', { matchId, opponent: { id: socket.id, nickname: p.nickname } });
-      io.to(socket.id).emit('tetris:start', { matchId, opponent: { id: oppId, nickname: opp.nickname } });
-      ack && ack({ ok: true, matched: true });
-    } else {
-      // 대기열 등록
-      tetrisWaiting = socket.id;
-      ack && ack({ ok: true, waiting: true });
-    }
+  // ── 테트리스 대기방 로비 ──
+  // 로비 입장 (방 목록 구독)
+  socket.on('tetris:lobby:enter', (data, ack) => {
+    socket.join(TETRIS_LOBBY);
+    ack && ack({ rooms: lobbyList() });
   });
 
-  // 매칭 취소
-  socket.on('tetris:cancel', () => {
-    if (tetrisWaiting === socket.id) tetrisWaiting = null;
+  // 로비 퇴장
+  socket.on('tetris:lobby:leave', () => {
+    socket.leave(TETRIS_LOBBY);
+  });
+
+  // 방 생성 (방장)
+  socket.on('tetris:room:create', (data, ack) => {
+    const p = players.get(socket.id);
+    if (!p) return ack && ack({ ok: false });
+    leaveTetrisRoom(socket.id); // 기존에 속한 방 정리
+    const id = `r${++roomSeq}`;
+    const room = { id, host: socket.id, hostName: p.nickname, guest: null, guestName: null };
+    tetrisRooms.set(id, room);
+    ack && ack({ ok: true, room: roomState(room, socket.id) });
+    broadcastLobby();
+  });
+
+  // 방 참가 (게스트)
+  socket.on('tetris:room:join', (data, ack) => {
+    const p = players.get(socket.id);
+    const room = tetrisRooms.get(data?.roomId);
+    if (!p || !room) return ack && ack({ ok: false, error: '방이 없습니다' });
+    if (room.guest) return ack && ack({ ok: false, error: '방이 가득 찼습니다' });
+    if (room.host === socket.id) return ack && ack({ ok: false, error: '자신의 방입니다' });
+    room.guest = socket.id;
+    room.guestName = p.nickname;
+    ack && ack({ ok: true, room: roomState(room, socket.id) });
+    io.to(room.host).emit('tetris:room:update', roomState(room, room.host));
+    broadcastLobby();
+  });
+
+  // 방 나가기
+  socket.on('tetris:room:leave', () => {
+    leaveTetrisRoom(socket.id);
+    broadcastLobby();
+  });
+
+  // 방장이 게임 시작
+  socket.on('tetris:room:start', (data, ack) => {
+    const room = tetrisRooms.get(data?.roomId);
+    if (!room || room.host !== socket.id) return ack && ack({ ok: false });
+    if (!room.guest) return ack && ack({ ok: false, error: '상대가 없습니다' });
+    const hostP = players.get(room.host);
+    const guestP = players.get(room.guest);
+    if (!hostP || !guestP) return ack && ack({ ok: false, error: '상대가 나갔습니다' });
+    const matchId = `m${++matchSeq}`;
+    matches.set(matchId, { players: [room.host, room.guest] });
+    io.to(room.host).emit('tetris:start', { matchId, opponent: { id: room.guest, nickname: guestP.nickname } });
+    io.to(room.guest).emit('tetris:start', { matchId, opponent: { id: room.host, nickname: hostP.nickname } });
+    tetrisRooms.delete(room.id);
+    ack && ack({ ok: true });
+    broadcastLobby();
   });
 
   // 보드 상태 중계 (상대 미니뷰용)
@@ -394,8 +466,9 @@ io.on('connection', (socket) => {
     const p = players.get(socket.id);
     players.delete(socket.id);
 
-    // 테트리스 매칭/매치 정리
-    if (tetrisWaiting === socket.id) tetrisWaiting = null;
+    // 테트리스 방/매치 정리
+    leaveTetrisRoom(socket.id);
+    broadcastLobby();
     for (const [mid, m] of matches) {
       if (m.players.includes(socket.id)) {
         const oppId = m.players.find((id) => id !== socket.id);

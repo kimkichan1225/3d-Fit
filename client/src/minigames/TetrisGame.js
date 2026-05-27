@@ -22,8 +22,13 @@ const COLORS = {
 const TYPES = Object.keys(SHAPES);
 
 const LINE_SCORES = [0, 100, 300, 500, 800];
-// 지운 줄 수 → 상대에게 보내는 공격 줄 수 (2a 기본값, 2b에서 게이지로 정교화 예정)
-const ATTACK_TABLE = [0, 0, 1, 2, 4];
+
+// ── 대결 공격 게이지 시스템 ──
+const GAUGE_MAX = 100; // 이 값에 도달하면 발사
+const GAUGE_TABLE = [0, 15, 35, 60, 100]; // 동시 클리어 줄 수 → 게이지 적립(①)
+const GARBAGE_BONUS = 5; // 방해 줄 1줄 정리당 추가 게이지(②)
+const COMBO_BONUS = 5; // 콤보 단계당 추가 게이지(③)
+const ATTACK_LINES = 4; // 게이지 발사 시 상대에게 보낼 방해 줄 수(④)
 
 const emptyBoard = () => Array.from({ length: ROWS }, () => Array(COLS).fill(null));
 const randomType = () => TYPES[Math.floor(Math.random() * TYPES.length)];
@@ -70,6 +75,7 @@ function TetrisBoard({ mode, matchId, opponentName, onBack }) {
       lines: 0,
       level: 1,
       combo: 0,
+      gauge: 0, // 대결 공격 게이지 (0~100)
       pendingGarbage: 0, // 받은 공격 줄 (다음 고정 때 정산)
       over: false,
       paused: false,
@@ -102,8 +108,10 @@ function TetrisBoard({ mode, matchId, opponentName, onBack }) {
     });
 
     let cleared = 0;
+    let garbageCleared = 0; // 지운 줄 중 방해 줄(가비지) 개수
     for (let r = ROWS - 1; r >= 0; r--) {
       if (board[r].every((cell) => cell)) {
+        if (board[r].some((cell) => cell === 'garbage')) garbageCleared++;
         board.splice(r, 1);
         board.unshift(Array(COLS).fill(null));
         cleared++;
@@ -122,12 +130,19 @@ function TetrisBoard({ mode, matchId, opponentName, onBack }) {
     if (isVersus) {
       const sock = getSocket();
       if (cleared > 0) {
-        // 공격 줄 = 기본 변환 + 콤보 보너스
-        const comboBonus = Math.max(0, Math.floor((s.combo - 1) / 2));
-        const attack = (ATTACK_TABLE[cleared] || 0) + comboBonus;
-        if (attack > 0) sock.emit('tetris:attack', { matchId, lines: attack });
-      } else if (s.pendingGarbage > 0) {
-        // 줄을 못 지웠으면 받아둔 공격 줄을 보드에 추가
+        // 게이지 적립: ① 동시 클리어 + ② 방해 줄 정리 + ③ 콤보
+        let gain = GAUGE_TABLE[cleared] || 0;
+        gain += garbageCleared * GARBAGE_BONUS;
+        gain += Math.max(0, s.combo - 1) * COMBO_BONUS;
+        s.gauge += gain;
+        // ④ 게이지가 가득 차면 발사 (초과분 이월)
+        while (s.gauge >= GAUGE_MAX) {
+          s.gauge -= GAUGE_MAX;
+          sock.emit('tetris:attack', { matchId, lines: ATTACK_LINES });
+        }
+      }
+      // 상쇄 없음: 받은 방해 줄은 줄 지움 여부와 무관하게 쌓인다
+      if (s.pendingGarbage > 0) {
         addGarbage(s.pendingGarbage);
         s.pendingGarbage = 0;
       }
@@ -334,6 +349,21 @@ function TetrisBoard({ mode, matchId, opponentName, onBack }) {
 
         {isVersus && (
           <div style={panel}>
+            <div style={labelStyle}>공격 게이지</div>
+            <div style={gaugeOuter}>
+              <div
+                style={{
+                  ...gaugeInner,
+                  width: `${Math.min(100, s.gauge)}%`,
+                  background: s.gauge >= 80 ? '#ef4444' : s.gauge >= 50 ? '#eab308' : '#5b8def',
+                }}
+              />
+            </div>
+          </div>
+        )}
+
+        {isVersus && (
+          <div style={panel}>
             <div style={labelStyle}>상대: {opponentName}</div>
             <MiniBoard board={opponentBoard} />
           </div>
@@ -371,7 +401,7 @@ function MiniBoard({ board }) {
 }
 
 // 단색 버튼 (hover 피드백 포함)
-function Button({ children, onClick, variant = 'primary' }) {
+function Button({ children, onClick, variant = 'primary', disabled }) {
   const [hover, setHover] = useState(false);
   const base = variant === 'primary' ? primaryBtn : ghostBtn;
   const hov = variant === 'primary'
@@ -379,10 +409,15 @@ function Button({ children, onClick, variant = 'primary' }) {
     : { background: 'rgba(255,255,255,0.08)', borderColor: 'rgba(255,255,255,0.3)' };
   return (
     <button
-      style={{ ...base, ...(hover ? hov : null) }}
+      style={{
+        ...base,
+        ...(hover && !disabled ? hov : null),
+        ...(disabled ? { opacity: 0.45, cursor: 'default' } : null),
+      }}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
-      onClick={onClick}
+      onClick={disabled ? undefined : onClick}
+      disabled={disabled}
     >
       {children}
     </button>
@@ -423,16 +458,32 @@ export function TetrisGame({ onExit }) {
   const [match, setMatch] = useState(null);
   const [result, setResult] = useState(null);
   const [ranking, setRanking] = useState([]);
+  const [rooms, setRooms] = useState([]); // 로비 방 목록
+  const [currentRoom, setCurrentRoom] = useState(null); // 내가 들어간 방
 
   useEffect(() => {
     const sock = getSocket();
-    const onStart = (m) => { setMatch(m); setPhase('versus'); };
+    const onStart = (m) => {
+      sock.emit('tetris:lobby:leave');
+      setMatch(m);
+      setCurrentRoom(null);
+      setPhase('versus');
+    };
     const onResult = (r) => { setResult(r); setPhase('result'); };
+    const onLobby = ({ rooms: list }) => setRooms(list);
+    const onRoomUpdate = (room) => setCurrentRoom(room);
+    const onRoomClosed = () => { setCurrentRoom(null); setPhase('lobby'); };
     sock.on('tetris:start', onStart);
     sock.on('tetris:result', onResult);
+    sock.on('tetris:lobby:update', onLobby);
+    sock.on('tetris:room:update', onRoomUpdate);
+    sock.on('tetris:room:closed', onRoomClosed);
     return () => {
       sock.off('tetris:start', onStart);
       sock.off('tetris:result', onResult);
+      sock.off('tetris:lobby:update', onLobby);
+      sock.off('tetris:room:update', onRoomUpdate);
+      sock.off('tetris:room:closed', onRoomClosed);
     };
   }, []);
 
@@ -444,24 +495,85 @@ export function TetrisGame({ onExit }) {
     });
   }, [phase]);
 
-  const startVersus = () => {
-    setPhase('matching');
-    getSocket().emit('tetris:queue', {}, () => {});
+  const enterLobby = () => {
+    getSocket().emit('tetris:lobby:enter', {}, (resp) => {
+      if (resp?.rooms) setRooms(resp.rooms);
+    });
+    setPhase('lobby');
   };
-  const cancelMatch = () => {
-    getSocket().emit('tetris:cancel');
+  const backToMenuFromLobby = () => {
+    getSocket().emit('tetris:lobby:leave');
     setPhase('menu');
+  };
+  const createRoom = () => {
+    getSocket().emit('tetris:room:create', {}, (resp) => {
+      if (resp?.ok) { setCurrentRoom(resp.room); setPhase('room'); }
+    });
+  };
+  const joinRoom = (roomId) => {
+    getSocket().emit('tetris:room:join', { roomId }, (resp) => {
+      if (resp?.ok) { setCurrentRoom(resp.room); setPhase('room'); }
+    });
+  };
+  const leaveRoom = () => {
+    getSocket().emit('tetris:room:leave');
+    setCurrentRoom(null);
+    setPhase('lobby');
+  };
+  const startGame = () => {
+    if (!currentRoom) return;
+    getSocket().emit('tetris:room:start', { roomId: currentRoom.id }, () => {});
   };
 
   if (phase === 'single') return <TetrisBoard mode="single" onBack={() => setPhase('menu')} />;
   if (phase === 'versus') return <TetrisBoard mode="versus" matchId={match.matchId} opponentName={match.opponent.nickname} />;
 
-  if (phase === 'matching') {
+  if (phase === 'lobby') {
     return (
       <div style={centerBox}>
-        <div style={{ fontSize: 18, fontWeight: 700 }}>상대를 찾는 중…</div>
-        <div style={{ opacity: 0.6, fontSize: 13, marginBottom: 4 }}>다른 플레이어가 대결을 시작하면 매칭됩니다</div>
-        <Button variant="ghost" onClick={cancelMatch}>취소</Button>
+        <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 6 }}>대결 로비</div>
+        <div style={lobbyListStyle}>
+          {rooms.length === 0 ? (
+            <div style={rankEmpty}>열린 방이 없어요. 방을 만들어보세요!</div>
+          ) : (
+            rooms.map((r) => (
+              <div key={r.id} style={roomRow}>
+                <span style={{ flex: 1, textAlign: 'left', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {r.hostName}의 방
+                </span>
+                <span style={{ opacity: 0.6, fontSize: 12 }}>{r.count}/2</span>
+                <Button variant="ghost" onClick={() => joinRoom(r.id)} disabled={r.full}>
+                  {r.full ? '가득' : '참가'}
+                </Button>
+              </div>
+            ))
+          )}
+        </div>
+        <Button onClick={createRoom}>방 만들기</Button>
+        <Button variant="ghost" onClick={backToMenuFromLobby}>뒤로</Button>
+      </div>
+    );
+  }
+
+  if (phase === 'room' && currentRoom) {
+    const cr = currentRoom;
+    return (
+      <div style={centerBox}>
+        <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 8 }}>{cr.hostName}의 방</div>
+        <div style={roomSlots}>
+          <div style={slot}>👑 {cr.hostName}</div>
+          <div style={{ ...slot, opacity: cr.guestName ? 1 : 0.5 }}>
+            {cr.guestName || '상대 대기 중…'}
+          </div>
+        </div>
+        {cr.isHost ? (
+          <Button onClick={startGame} disabled={cr.count < 2}>
+            {cr.count < 2 ? '상대 대기 중…' : '게임 시작'}
+          </Button>
+        ) : (
+          <div style={{ opacity: 0.7, fontSize: 13, padding: '8px 0' }}>방장이 시작하기를 기다리는 중…</div>
+        )}
+        <Button variant="ghost" onClick={leaveRoom}>나가기</Button>
       </div>
     );
   }
@@ -492,7 +604,7 @@ export function TetrisGame({ onExit }) {
         </div>
         <div style={menuButtons}>
           <Button onClick={() => setPhase('single')}>혼자 하기</Button>
-          <Button onClick={startVersus}>대결 (1:1)</Button>
+          <Button onClick={enterLobby}>대결 (1:1)</Button>
           <Button variant="ghost" onClick={onExit}>나가기</Button>
         </div>
       </div>
@@ -546,6 +658,16 @@ const panel = { background: 'rgba(255,255,255,0.06)', borderRadius: 8, padding: 
 const labelStyle = { fontSize: 11, color: 'rgba(255,255,255,0.6)' };
 const value = { fontSize: 20, fontWeight: 700, color: '#fff' };
 const help = { fontSize: 11, color: 'rgba(255,255,255,0.55)', lineHeight: 1.6, marginTop: 4 };
+
+const gaugeOuter = {
+  width: '100%', height: 14, borderRadius: 7, marginTop: 6,
+  background: 'rgba(0,0,0,0.4)', overflow: 'hidden',
+  border: '1px solid rgba(255,255,255,0.1)',
+};
+const gaugeInner = {
+  height: '100%', borderRadius: 7,
+  transition: 'width 0.12s linear, background 0.2s',
+};
 
 const centerBox = {
   display: 'flex', flexDirection: 'column', alignItems: 'center',
@@ -607,6 +729,40 @@ const rankEmpty = {
 const rankRow = {
   display: 'flex', alignItems: 'center', gap: 8,
   fontSize: 13, color: 'rgba(255,255,255,0.85)', padding: '3px 0',
+};
+
+const lobbyListStyle = {
+  width: 300,
+  minHeight: 120,
+  maxHeight: 260,
+  overflowY: 'auto',
+  background: 'rgba(0,0,0,0.25)',
+  borderRadius: 10,
+  border: '1px solid rgba(255,255,255,0.08)',
+  padding: 10,
+  margin: '6px 0 14px',
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 6,
+};
+
+const roomRow = {
+  display: 'flex', alignItems: 'center', gap: 10,
+  background: 'rgba(255,255,255,0.05)',
+  borderRadius: 8, padding: '8px 12px',
+  fontSize: 14, color: '#fff',
+};
+
+const roomSlots = {
+  display: 'flex', flexDirection: 'column', gap: 8,
+  width: 280, margin: '4px 0 14px',
+};
+
+const slot = {
+  background: 'rgba(255,255,255,0.06)',
+  borderRadius: 8, padding: '12px 14px',
+  fontSize: 15, fontWeight: 600, textAlign: 'center',
+  border: '1px solid rgba(255,255,255,0.1)',
 };
 
 const primaryBtn = {
