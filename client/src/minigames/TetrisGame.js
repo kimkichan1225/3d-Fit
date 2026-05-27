@@ -102,6 +102,8 @@ function TetrisBoard({ mode, matchId, opponentName, onBack }) {
       gauge: 0, // 대결 공격 게이지 (0~100)
       pendingGarbage: 0, // 받은 공격 줄 (다음 고정 때 정산)
       countdown: 3, // 시작 카운트다운
+      hold: null, // 홀드한 조각 타입
+      canHold: true, // 이번 조각에서 홀드 가능 여부
       over: false,
       paused: false,
     };
@@ -224,6 +226,7 @@ function TetrisBoard({ mode, matchId, opponentName, onBack }) {
     } else {
       s.piece = { type, shape, row: 0, col };
       s.next = randomType();
+      s.canHold = true; // 새 조각이 나오면 다시 홀드 가능
     }
 
     if (isVersus) getSocket().emit('tetris:board', { matchId, board: s.board });
@@ -274,6 +277,27 @@ function TetrisBoard({ mode, matchId, opponentName, onBack }) {
     lockPiece();
     force();
   }, [lockPiece]);
+
+  const hold = useCallback(() => {
+    const s = g.current;
+    if (!s || s.over || s.paused || s.countdown > 0 || !s.canHold) return;
+    const cur = s.piece.type;
+    const spawn = (type) => {
+      const shape = SHAPES[type];
+      return { type, shape, row: 0, col: Math.floor((COLS - shape[0].length) / 2) };
+    };
+    if (s.hold) {
+      const swapped = s.hold;
+      s.hold = cur;
+      s.piece = spawn(swapped);
+    } else {
+      s.hold = cur;
+      s.piece = spawn(s.next);
+      s.next = randomType();
+    }
+    s.canHold = false; // 다음 조각 고정 전까지 다시 홀드 불가
+    force();
+  }, []);
 
   useEffect(() => {
     reset();
@@ -331,18 +355,33 @@ function TetrisBoard({ mode, matchId, opponentName, onBack }) {
         case 'ArrowDown': e.preventDefault(); step(); break;
         case 'ArrowUp': case 'x': case 'X': e.preventDefault(); rotate(); break;
         case ' ': e.preventDefault(); hardDrop(); break;
+        case 'c': case 'C': case 'Shift': e.preventDefault(); hold(); break;
         default: break;
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [move, rotate, step, hardDrop, onBack, isVersus]);
+  }, [move, rotate, step, hardDrop, hold, onBack, isVersus]);
 
   const s = g.current;
   if (!s) return null;
 
   const display = s.board.map((row) => row.slice());
   if (!s.over && s.piece) {
+    // 고스트: 현재 조각이 떨어질 최종 위치 (빈 칸에만 표시)
+    let ghostRow = s.piece.row;
+    while (canPlace(s.board, s.piece.shape, ghostRow + 1, s.piece.col)) ghostRow += 1;
+    s.piece.shape.forEach((rowArr, i) => {
+      rowArr.forEach((v, j) => {
+        if (!v) return;
+        const r = ghostRow + i;
+        const c = s.piece.col + j;
+        if (r >= 0 && r < ROWS && c >= 0 && c < COLS && !display[r][c]) {
+          display[r][c] = `ghost-${s.piece.type}`;
+        }
+      });
+    });
+    // 실제 조각 (고스트 위에 덮어씀)
     s.piece.shape.forEach((rowArr, i) => {
       rowArr.forEach((v, j) => {
         if (!v) return;
@@ -362,17 +401,23 @@ function TetrisBoard({ mode, matchId, opponentName, onBack }) {
       ))}
       <div ref={boardRef} style={{ ...boardStyle(CELL), ...(flash ? boardFlash : null) }}>
         {display.map((row, i) =>
-          row.map((cell, j) => (
-            <div
-              key={`${i}-${j}`}
-              style={{
-                width: CELL, height: CELL,
-                background: cell ? COLORS[cell] : 'rgba(255,255,255,0.04)',
-                border: cell ? '1px solid rgba(0,0,0,0.25)' : '1px solid rgba(255,255,255,0.03)',
-                boxSizing: 'border-box',
-              }}
-            />
-          ))
+          row.map((cell, j) => {
+            const ghost = typeof cell === 'string' && cell.startsWith('ghost-');
+            const type = ghost ? cell.slice(6) : cell;
+            return (
+              <div
+                key={`${i}-${j}`}
+                style={{
+                  width: CELL, height: CELL,
+                  background: ghost ? 'transparent' : (type ? COLORS[type] : 'rgba(255,255,255,0.04)'),
+                  border: ghost
+                    ? `2px solid ${COLORS[type]}66`
+                    : (type ? '1px solid rgba(0,0,0,0.25)' : '1px solid rgba(255,255,255,0.03)'),
+                  boxSizing: 'border-box',
+                }}
+              />
+            );
+          })
         )}
 
         {s.countdown > 0 && (
@@ -411,6 +456,19 @@ function TetrisBoard({ mode, matchId, opponentName, onBack }) {
           <div style={value}>{s.lines} / {s.level}</div>
         </div>
         <div style={panel}>
+          <div style={labelStyle}>홀드 (C)</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 2, marginTop: 6, opacity: s.canHold ? 1 : 0.4 }}>
+            {(s.hold ? SHAPES[s.hold] : []).map((row, i) => (
+              <div key={i} style={{ display: 'flex', gap: 2 }}>
+                {row.map((v, j) => (
+                  <div key={j} style={{ width: 14, height: 14, background: v ? COLORS[s.hold] : 'transparent' }} />
+                ))}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div style={panel}>
           <div style={labelStyle}>다음</div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 2, marginTop: 6 }}>
             {nextShape.map((row, i) => (
@@ -447,7 +505,7 @@ function TetrisBoard({ mode, matchId, opponentName, onBack }) {
         )}
 
         <div style={help}>
-          ← → 이동 · ↑/X 회전<br />↓ 소프트드롭 · Space 하드드롭
+          ← → 이동 · ↑/X 회전<br />↓ 소프트드롭 · Space 하드드롭<br />C 홀드
           {!isVersus && <><br />P 일시정지 · Esc 메뉴</>}
         </div>
       </div>
